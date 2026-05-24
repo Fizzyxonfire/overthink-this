@@ -2213,21 +2213,30 @@ async def create_checkout(body: CheckoutRequest, user: dict = Depends(get_curren
     base_https = "https://overthink-this-api.onrender.com"
     success_url = f"{base_https}/api/payments/return?session_id={{CHECKOUT_SESSION_ID}}&action=success"
     cancel_url  = f"{base_https}/api/payments/return?action=cancel"
+    # Weekly + monthly → recurring subscriptions. Lifetime → one-time.
+    is_subscription = pkg["id"] in {"weekly", "monthly"}
+    interval = "week" if pkg["id"] == "weekly" else "month" if pkg["id"] == "monthly" else None
+    price_data: dict = {
+        "currency": pkg["currency"],
+        "product_data": {"name": pkg["label"]},
+        "unit_amount": int(round(pkg["amount"] * 100)),
+    }
+    if interval:
+        price_data["recurring"] = {"interval": interval}
     try:
         session = stripe.checkout.Session.create(
-            mode="payment",
+            mode="subscription" if is_subscription else "payment",
             payment_method_types=["card"],
             line_items=[{
-                "price_data": {
-                    "currency": pkg["currency"],
-                    "product_data": {"name": pkg["label"]},
-                    "unit_amount": int(round(pkg["amount"] * 100)),
-                },
+                "price_data": price_data,
                 "quantity": 1,
             }],
             success_url=success_url,
             cancel_url=cancel_url,
             metadata={"user_id": user["user_id"], "package_id": pkg["id"]},
+            # For subscriptions, attach user_id to the subscription too so the
+            # webhook can find them on renewal events.
+            subscription_data={"metadata": {"user_id": user["user_id"], "package_id": pkg["id"]}} if is_subscription else None,
         )
     except Exception as exc:
         raise HTTPException(502, f"Stripe error: {exc}")
@@ -2322,6 +2331,12 @@ async def payments_return(session_id: Optional[str] = None, action: str = "succe
 
 @app.get("/api/payments/status/{session_id}")
 async def payment_status(session_id: str, user: dict = Depends(get_current_user)):
+    """Polling endpoint the app hits while showing 'Verifying…' on the
+    payment-success screen. Accepts either:
+      • subscription checkout where session.status == 'complete'
+      • one-time payment where payment_status == 'paid'
+    Either way we apply the plan inline so the user doesn't need the webhook
+    to fire first."""
     if not STRIPE_API_KEY:
         raise HTTPException(503, "Stripe not configured")
     stripe = stripe_lib()
@@ -2329,15 +2344,37 @@ async def payment_status(session_id: str, user: dict = Depends(get_current_user)
         session = stripe.checkout.Session.retrieve(session_id)
     except Exception as exc:
         raise HTTPException(502, f"Stripe error: {exc}")
-    paid = session.get("payment_status") == "paid"
-    if paid:
+
+    payment_status = session.get("payment_status")
+    sess_status = session.get("status")
+    mode = session.get("mode")
+
+    # A subscription is considered active once status == "complete" (Stripe
+    # has charged the first invoice). A one-time payment uses payment_status.
+    is_done = (
+        payment_status == "paid"
+        or payment_status == "no_payment_required"
+        or (mode == "subscription" and sess_status == "complete")
+    )
+
+    if is_done:
         await apply_plan(session_id)
+
+    # Re-read the DB to confirm `applied` so the frontend stops polling
+    async with pool.acquire() as conn:
+        tx = await conn.fetchrow(
+            "SELECT plan_applied FROM payment_transactions WHERE session_id = $1",
+            session_id,
+        )
+    applied = bool(tx and tx["plan_applied"])
+
     return {
         "session_id": session_id,
-        "payment_status": session.get("payment_status"),
-        "status": session.get("status"),
+        "payment_status": payment_status,
+        "status": sess_status,
+        "mode": mode,
         "amount_total": session.get("amount_total"),
-        "applied": paid,
+        "applied": applied,
     }
 
 
