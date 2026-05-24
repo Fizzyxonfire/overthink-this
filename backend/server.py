@@ -493,7 +493,12 @@ async def update_customization(body: CustomizeRequest, user: dict = Depends(get_
             raise HTTPException(403, "Title not unlocked")
         requested["active_title"] = body.active_title
     if body.name_color is not None:
-        if body.name_color and f"name_color:{body.name_color}" not in unlocked:
+        # Default colors (white #F4F3F7, black #161520) are ALWAYS allowed,
+        # plus null which clears the choice. Everything else needs unlock.
+        DEFAULT_COLORS = {"#F4F3F7", "#161520"}
+        if (body.name_color
+            and body.name_color not in DEFAULT_COLORS
+            and f"name_color:{body.name_color}" not in unlocked):
             raise HTTPException(403, "Name color not unlocked")
         requested["name_color"] = body.name_color
     if body.card_theme is not None:
@@ -843,6 +848,32 @@ def fallback_payload(situation_text: str, tone: str) -> dict:
     }
 
 
+def _best_effort_json_cleanup(raw: str) -> str:
+    """Salvage Gemini output that breaks JSON only because of unescaped
+    line breaks / control chars inside string values. We escape literal
+    newlines, carriage returns, and tabs that appear between matching
+    string-content quotes. Imperfect but rescues the common failure."""
+    import re
+    # Walk char-by-char, track whether we're inside a JSON string
+    out = []
+    in_string = False
+    escape = False
+    for ch in raw:
+        if escape:
+            out.append(ch); escape = False; continue
+        if ch == "\\" and in_string:
+            out.append(ch); escape = True; continue
+        if ch == '"':
+            in_string = not in_string
+            out.append(ch); continue
+        if in_string and ch in ("\n", "\r"):
+            out.append("\\n"); continue
+        if in_string and ch == "\t":
+            out.append("\\t"); continue
+        out.append(ch)
+    return "".join(out)
+
+
 def _build_prompt(situation_text: str, tone: str, category: str = "") -> str:
     """Assemble the full Gemini prompt by injecting the user's situation
     into the tone-specific template."""
@@ -851,7 +882,16 @@ def _build_prompt(situation_text: str, tone: str, category: str = "") -> str:
     return f"""{voice}
 
 YOUR JOB:
-Read the spiral below. Produce an Outcome Map in the voice above, GROUNDED IN THE SPECIFIC DETAILS of what the user wrote. Every field must reference concrete elements from THEIR situation — never generic. If they mention a name, a deadline, a number — use it.
+Read the spiral below. Produce an Outcome Map in the voice above, GROUNDED IN THE SPECIFIC DETAILS of what the user wrote. Every field must reference concrete elements from THEIR situation — never generic.
+
+ANTI-PATTERN RULES (read carefully — break the AI mold):
+- DO NOT start outcomes with "You wake up..." / "It turns out..." / "Most likely...". Vary openings.
+- DO NOT structure every reality_check the same way. Some are questions, some are dry observations, some are images, some are direct dares.
+- DO NOT use the words "spiral", "overthinking", "ruminate", "anxiety" in the response. The user already knows what they're doing here — naming it makes it feel clinical.
+- DO NOT start the verdict with "You're" or "Stop". Surprise them with structure.
+- Probability numbers should NOT always be round (55/30/15). Mix — sometimes 47/38/15, sometimes 60/25/15. Whatever the situation actually feels like.
+- Reference random small things they wrote (a time, a name, a specific object) and make THEM the anchor of one description.
+- Vary description length WITHIN the response — one can be 4 sentences, another 6. Don't be metronome-uniform.
 
 OUTPUT FORMAT — JSON ONLY, NO MARKDOWN:
 {{
@@ -930,9 +970,12 @@ async def run_gemini(situation_text: str, tone: str, category: str = "") -> dict
 
         client = genai.Client(api_key=GEMINI_API_KEY)
 
+        # High temperature + top_k=40 = more wandering, more variety in word
+        # choice. Helps break the AI-detectable patterns.
         config = gen_types.GenerateContentConfig(
-            temperature=1.0,
-            top_p=0.95,
+            temperature=1.15,
+            top_p=0.97,
+            top_k=40,
             max_output_tokens=4096,
             response_mime_type="application/json",
         )
@@ -976,7 +1019,14 @@ async def run_gemini(situation_text: str, tone: str, category: str = "") -> dict
         if not text:
             raise ValueError("empty response after stripping fences")
 
-        data = json.loads(text)
+        # Gemini sometimes emits literal newlines INSIDE string values which
+        # is invalid JSON. Try strict parsing first; on failure, attempt a
+        # best-effort cleanup before re-parsing.
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            cleaned = _best_effort_json_cleanup(text)
+            data = json.loads(cleaned)
         data["_ai_model"] = used_model
 
         # ---- normalise + validate ----
