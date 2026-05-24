@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+asyncpg
+python-dotenv
+google-genai
+stripe
+httpx
+pydantic
+gunicorn
+uvicorn-worker
