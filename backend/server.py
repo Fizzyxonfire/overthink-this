@@ -652,7 +652,7 @@ EXAMPLE OUTPUT:
     "Write down, in one sentence, the thing you actually want her to say back. Then close the app and go outside for ten minutes."
   ],
   "verdict": {
-    "verdict_text": "You're treating a six-hour gap like a verdict — Sara is just having a Tuesday."
+    "verdict_text": "Sara is having a Tuesday. You're having a trial."
   }
 }
 """
@@ -814,7 +814,7 @@ OUTPUT FORMAT — JSON ONLY, NO MARKDOWN:
     "Exactly 3 concrete actions. Each one is something they could literally start in the next hour. Specific verbs. No 'try to' or 'maybe consider'. Be definite."
   ],
   "verdict": {{
-    "verdict_text": "ONE sentence that ends the loop. The thing they need to hear. It must sound like YOU, not a fortune cookie. It should make them feel something — a soft sigh, a small laugh, an exhale."
+    "verdict_text": "A MOTTO. Maximum 12 words. Short, punchy, memorable — the kind of line someone could tattoo. NEVER an explanation, NEVER a paragraph. One bold sentence that hits like a punchline. Examples of good length: 'You're auditioning for a role nobody's casting.' / 'Stop rehearsing the apology nobody asked for.' / 'The room moved on three hours ago.'"
   }}
 }}
 
