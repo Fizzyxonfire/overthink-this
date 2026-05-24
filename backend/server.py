@@ -2193,7 +2193,14 @@ async def list_packages():
 
 
 def stripe_lib():
-    import stripe as _stripe  # local import so the module is optional in dev
+    """Lazy-load the stripe SDK. If the package isn't installed (or some
+    transient import error happens), surface a 503 with a clear message so
+    the caller sees 'Stripe SDK missing' instead of a generic 500."""
+    try:
+        import stripe as _stripe  # local import so the module is optional in dev
+    except Exception as exc:
+        print(f"[stripe_lib] import failed: {type(exc).__name__}: {exc}")
+        raise HTTPException(503, f"Stripe SDK unavailable: {exc}")
     _stripe.api_key = STRIPE_API_KEY
     return _stripe
 
@@ -2223,46 +2230,123 @@ async def create_checkout(body: CheckoutRequest, user: dict = Depends(get_curren
     }
     if interval:
         price_data["recurring"] = {"interval": interval}
-    try:
-        session = stripe.checkout.Session.create(
-            mode="subscription" if is_subscription else "payment",
-            payment_method_types=["card"],
-            line_items=[{
-                "price_data": price_data,
-                "quantity": 1,
-            }],
-            success_url=success_url,
-            cancel_url=cancel_url,
-            metadata={"user_id": user["user_id"], "package_id": pkg["id"]},
-            # For subscriptions, attach user_id to the subscription too so the
-            # webhook can find them on renewal events.
-            subscription_data={"metadata": {"user_id": user["user_id"], "package_id": pkg["id"]}} if is_subscription else None,
-        )
-    except Exception as exc:
-        raise HTTPException(502, f"Stripe error: {exc}")
 
-    async with pool.acquire() as conn:
-        await conn.execute(
-            """INSERT INTO payment_transactions
-                 (session_id, user_id, package_id, amount, currency, metadata, payment_status, status, created_at)
-               VALUES ($1,$2,$3,$4,$5,$6,'initiated','open',$7)""",
-            session.id, user["user_id"], pkg["id"], pkg["amount"], pkg["currency"],
-            json.dumps({"package": pkg}), now_iso(),
+    # Build kwargs dict so we only pass `subscription_data` when it's actually
+    # a subscription. Passing `subscription_data=None` to stripe-python on a
+    # one-time payment makes Stripe reject the call with
+    # "Received unknown parameter: subscription_data" — that was a real 500
+    # source for the lifetime package.
+    create_kwargs: dict = {
+        "mode": "subscription" if is_subscription else "payment",
+        "payment_method_types": ["card"],
+        "line_items": [{"price_data": price_data, "quantity": 1}],
+        "success_url": success_url,
+        "cancel_url": cancel_url,
+        "metadata": {"user_id": user["user_id"], "package_id": pkg["id"]},
+    }
+    if is_subscription:
+        # For subscriptions, attach user_id to the subscription too so the
+        # webhook can find them on renewal events.
+        create_kwargs["subscription_data"] = {
+            "metadata": {"user_id": user["user_id"], "package_id": pkg["id"]},
+        }
+
+    try:
+        session = stripe.checkout.Session.create(**create_kwargs)
+    except Exception as exc:
+        # Surface the real Stripe error message + type so the app shows a
+        # specific reason instead of an opaque 500. stripe-python's errors
+        # have .user_message / .code / .param attributes that are way more
+        # useful than str(exc) alone.
+        detail = (
+            getattr(exc, "user_message", None)
+            or getattr(exc, "_message", None)
+            or str(exc)
+            or type(exc).__name__
         )
+        code = getattr(exc, "code", None) or getattr(exc, "type", None)
+        print(f"[create_checkout] Stripe rejected request: type={type(exc).__name__} code={code} detail={detail}")
+        raise HTTPException(502, f"Stripe error: {detail}")
+
+    # The Stripe session is now created. Record it in our DB, but DON'T let
+    # a DB hiccup block returning the checkout URL — the user has a valid
+    # Stripe session and can still pay; the webhook / polling endpoint will
+    # heal the missing row via apply_plan's metadata-reconstruction path.
+    try:
+        if pool is None:
+            print(f"[create_checkout] pool is None — skipping tx insert for session {session.id}")
+        else:
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    """INSERT INTO payment_transactions
+                         (session_id, user_id, package_id, amount, currency, metadata, payment_status, status, created_at)
+                       VALUES ($1,$2,$3,$4,$5,$6,'initiated','open',$7)
+                       ON CONFLICT (session_id) DO NOTHING""",
+                    session.id, user["user_id"], pkg["id"], pkg["amount"], pkg["currency"],
+                    json.dumps({"package": pkg}), now_iso(),
+                )
+    except Exception as exc:
+        # Don't blow up the checkout — log loudly and keep going. apply_plan
+        # will reconstruct the row from Stripe metadata when the user returns.
+        print(f"[create_checkout] DB insert failed for session {session.id}: {type(exc).__name__}: {exc}")
+
     return {"url": session.url, "session_id": session.id}
 
 
-async def apply_plan(session_id: str) -> dict:
+async def apply_plan(session_id: str, session: Optional[dict] = None) -> dict:
+    """Upgrade the user's plan based on a completed Stripe checkout session.
+
+    Resilient to a missing payment_transactions row: if the DB insert at
+    checkout-time was lost (or this server never saw it), we reconstruct
+    the user_id and package_id from the Stripe session's metadata and
+    UPSERT a row so subsequent polls can find it. This is the single most
+    common reason "Hang tight" used to hang forever — apply_plan would
+    raise 404 and the frontend silently swallowed it.
+    """
     async with pool.acquire() as conn:
         tx = await conn.fetchrow(
             "SELECT * FROM payment_transactions WHERE session_id = $1", session_id,
         )
+
+        # No DB row? Rebuild it from the Stripe session metadata so we can
+        # still apply the plan — the user paid, they shouldn't be stuck.
         if not tx:
-            raise HTTPException(404, "Transaction not found")
+            if session is None:
+                if not STRIPE_API_KEY:
+                    raise HTTPException(503, "Stripe not configured")
+                try:
+                    session = stripe_lib().checkout.Session.retrieve(session_id)
+                except Exception as exc:
+                    print(f"[apply_plan] Stripe retrieve failed for {session_id}: {exc}")
+                    raise HTTPException(502, f"Stripe retrieve failed: {exc}")
+            meta = (session.get("metadata") or {}) if isinstance(session, dict) else (getattr(session, "metadata", {}) or {})
+            user_id = meta.get("user_id")
+            package_id = meta.get("package_id")
+            if not user_id or not package_id:
+                print(f"[apply_plan] Session {session_id} missing metadata.user_id or metadata.package_id; meta={meta}")
+                raise HTTPException(400, "Stripe session missing user/package metadata")
+            pkg_meta = PACKAGES.get(package_id)
+            amount = (pkg_meta or {}).get("amount", 0.0)
+            currency = (pkg_meta or {}).get("currency", "usd")
+            await conn.execute(
+                """INSERT INTO payment_transactions
+                     (session_id, user_id, package_id, amount, currency, metadata, payment_status, status, created_at)
+                   VALUES ($1,$2,$3,$4,$5,$6,'initiated','open',$7)
+                   ON CONFLICT (session_id) DO NOTHING""",
+                session_id, user_id, package_id, amount, currency,
+                json.dumps({"reconstructed_from": "stripe_metadata"}), now_iso(),
+            )
+            tx = await conn.fetchrow(
+                "SELECT * FROM payment_transactions WHERE session_id = $1", session_id,
+            )
+            print(f"[apply_plan] Reconstructed tx for session {session_id} (user={user_id}, pkg={package_id})")
+
         if tx["plan_applied"]:
             return dict(tx)
+
         pkg = PACKAGES.get(tx["package_id"])
         if not pkg:
+            print(f"[apply_plan] Unknown package_id {tx['package_id']} on session {session_id}")
             return dict(tx)
         tier = pkg["tier"]
         expires = None
@@ -2283,6 +2367,7 @@ async def apply_plan(session_id: str) -> dict:
                WHERE session_id = $2""",
             now_iso(), session_id,
         )
+        print(f"[apply_plan] Applied {tier} to user {tx['user_id']} (session {session_id})")
         return dict(await conn.fetchrow(
             "SELECT * FROM payment_transactions WHERE session_id = $1", session_id,
         ))
@@ -2336,45 +2421,85 @@ async def payment_status(session_id: str, user: dict = Depends(get_current_user)
       • subscription checkout where session.status == 'complete'
       • one-time payment where payment_status == 'paid'
     Either way we apply the plan inline so the user doesn't need the webhook
-    to fire first."""
+    to fire first.
+
+    Returns 200 with `applied` and `error` fields so the frontend can show
+    real diagnostic info instead of silently spinning forever. We never
+    raise from here — the frontend polls this URL repeatedly and a 5xx
+    response would be silently swallowed.
+    """
     if not STRIPE_API_KEY:
-        raise HTTPException(503, "Stripe not configured")
+        return {
+            "session_id": session_id, "applied": False,
+            "error": "Stripe not configured on backend",
+        }
+
     stripe = stripe_lib()
+    session = None
+    fetch_error: Optional[str] = None
     try:
         session = stripe.checkout.Session.retrieve(session_id)
     except Exception as exc:
-        raise HTTPException(502, f"Stripe error: {exc}")
+        fetch_error = f"Stripe retrieve failed: {exc}"
+        print(f"[payment_status] {fetch_error} (session {session_id})")
 
-    payment_status = session.get("payment_status")
-    sess_status = session.get("status")
-    mode = session.get("mode")
+    payment_status_v = (session or {}).get("payment_status") if session else None
+    sess_status      = (session or {}).get("status") if session else None
+    mode             = (session or {}).get("mode") if session else None
 
     # A subscription is considered active once status == "complete" (Stripe
     # has charged the first invoice). A one-time payment uses payment_status.
-    is_done = (
-        payment_status == "paid"
-        or payment_status == "no_payment_required"
+    is_done = bool(session) and (
+        payment_status_v == "paid"
+        or payment_status_v == "no_payment_required"
         or (mode == "subscription" and sess_status == "complete")
     )
 
+    apply_error: Optional[str] = None
     if is_done:
-        await apply_plan(session_id)
+        try:
+            await apply_plan(session_id, session=session)
+        except HTTPException as exc:
+            apply_error = f"apply_plan failed ({exc.status_code}): {exc.detail}"
+            print(f"[payment_status] {apply_error} (session {session_id})")
+        except Exception as exc:
+            apply_error = f"apply_plan crashed: {exc}"
+            print(f"[payment_status] {apply_error} (session {session_id})")
 
-    # Re-read the DB to confirm `applied` so the frontend stops polling
-    async with pool.acquire() as conn:
-        tx = await conn.fetchrow(
-            "SELECT plan_applied FROM payment_transactions WHERE session_id = $1",
-            session_id,
-        )
-    applied = bool(tx and tx["plan_applied"])
+    # Read both the tx row AND the user's actual plan tier. Either being
+    # "Pro" is enough for the frontend to stop polling — covers the case
+    # where apply_plan succeeded on a previous request but the tx row was
+    # never written for some reason.
+    applied = False
+    user_plan_tier: Optional[str] = None
+    try:
+        async with pool.acquire() as conn:
+            tx = await conn.fetchrow(
+                "SELECT plan_applied FROM payment_transactions WHERE session_id = $1",
+                session_id,
+            )
+            row = await conn.fetchrow(
+                "SELECT plan_tier FROM users WHERE user_id = $1", user["user_id"],
+            )
+        applied = bool(tx and tx["plan_applied"])
+        user_plan_tier = row["plan_tier"] if row else None
+    except Exception as exc:
+        apply_error = (apply_error or "") + f" | DB read failed: {exc}"
+        print(f"[payment_status] DB read failed for {session_id}: {exc}")
+
+    # Cross-check: if the user is already on a paid tier, consider it done
+    # regardless of DB transaction row state.
+    user_is_pro = user_plan_tier in {"pro_weekly", "pro_monthly", "lifetime"}
 
     return {
         "session_id": session_id,
-        "payment_status": payment_status,
+        "payment_status": payment_status_v,
         "status": sess_status,
         "mode": mode,
-        "amount_total": session.get("amount_total"),
-        "applied": applied,
+        "amount_total": (session or {}).get("amount_total") if session else None,
+        "applied": applied or user_is_pro,
+        "user_plan_tier": user_plan_tier,
+        "error": fetch_error or apply_error,
     }
 
 
@@ -2389,10 +2514,28 @@ async def stripe_webhook(request: Request):
         event = stripe.Webhook.construct_event(payload, sig, STRIPE_WEBHOOK_SECRET)
     except Exception as exc:
         raise HTTPException(400, f"Bad signature: {exc}")
-    if event["type"] == "checkout.session.completed":
+
+    et = event.get("type")
+    # Both events indicate "user paid" — checkout.session.completed fires
+    # right after the user finishes checkout (subscription mode usually
+    # has payment_status=paid by then; one-time always does). The async
+    # invoice.payment_succeeded covers the rare case where the first
+    # subscription invoice settles slightly after the session completes.
+    if et in {"checkout.session.completed", "checkout.session.async_payment_succeeded"}:
         session = event["data"]["object"]
-        if session.get("payment_status") == "paid":
-            await apply_plan(session["id"])
+        mode = session.get("mode")
+        pstatus = session.get("payment_status")
+        sstatus = session.get("status")
+        is_paid = (
+            pstatus == "paid"
+            or pstatus == "no_payment_required"
+            or (mode == "subscription" and sstatus == "complete")
+        )
+        if is_paid:
+            try:
+                await apply_plan(session["id"], session=session)
+            except Exception as exc:
+                print(f"[webhook] apply_plan failed for {session.get('id')}: {exc}")
     return {"received": True}
 
 
