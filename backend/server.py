@@ -118,7 +118,8 @@ async def app_key_gate(request: Request, call_next):
     # gets a pass. Health check too.
     if (
         path.startswith("/api/payments/webhook")
-        or path.startswith("/api/diag")  # diagnostic endpoints — browser-accessible
+        or path.startswith("/api/payments/return")  # HTTPS bridge for Stripe redirect
+        or path.startswith("/api/diag")
         or path == "/"
     ):
         return await call_next(request)
@@ -2034,27 +2035,18 @@ PACKAGES = {
 
 @app.post("/api/dev/grant_pro")
 async def dev_grant_pro(user: dict = Depends(get_current_user)):
-    """Full unlock for dev testing — sets Pro AND clears is_guest, AND grants
-    every cosmetic up to level 100. Anywhere we check `is_guest` to gate Pro
-    features (like /api/wrapped/current) now passes too."""
+    """Only flips plan_tier to lifetime (so Pro gating passes) and clears
+    is_guest. XP/level/cosmetics stay UNTOUCHED — so the user still has the
+    real progression-from-zero experience for testing tasks and Thinkpass+."""
     db_required()
-    # Build a complete unlocked-items list so every cosmetic shows as owned
-    all_unlocked: list[str] = [
-        f"{kind}:{value}" for (_lv, kind, value, _label) in LEVEL_UNLOCKS
-    ]
     async with pool.acquire() as conn:
         await conn.execute(
             """UPDATE users
                   SET plan_tier = 'lifetime',
                       plan_expires_at = NULL,
-                      is_guest = FALSE,
-                      xp = GREATEST(xp, 50000),
-                      level = 100,
-                      unlocked_items = $2,
-                      phone_verified = TRUE
+                      is_guest = FALSE
                 WHERE user_id = $1""",
             user["user_id"],
-            json.dumps(all_unlocked),
         )
         row = await conn.fetchrow("SELECT * FROM users WHERE user_id = $1", user["user_id"])
     return {"user": user_public(dict(row))}
@@ -2166,8 +2158,11 @@ async def create_checkout(body: CheckoutRequest, user: dict = Depends(get_curren
     if not STRIPE_API_KEY:
         raise HTTPException(503, "Stripe not configured")
     stripe = stripe_lib()
-    success_url = body.origin_url.rstrip("/") + "/payment-success?session_id={CHECKOUT_SESSION_ID}"
-    cancel_url = body.origin_url.rstrip("/") + "/paywall"
+    # Stripe rejects custom-scheme URLs. Route through our own HTTPS bridge
+    # that immediately redirects to the app's deep link.
+    base_https = "https://overthink-this-api.onrender.com"
+    success_url = f"{base_https}/api/payments/return?session_id={{CHECKOUT_SESSION_ID}}&action=success"
+    cancel_url  = f"{base_https}/api/payments/return?action=cancel"
     try:
         session = stripe.checkout.Session.create(
             mode="payment",
@@ -2234,6 +2229,47 @@ async def apply_plan(session_id: str) -> dict:
         ))
 
 
+# HTTPS bridge — Stripe sends users here after checkout, this page just
+# deep-links them back into the app. No auth required (anyone with the
+# session_id is fine; it's only useful to the app that created it).
+@app.get("/api/payments/return")
+async def payments_return(session_id: Optional[str] = None, action: str = "success"):
+    from fastapi.responses import HTMLResponse
+    deep_link = (
+        f"overthink://payment-success?session_id={session_id}"
+        if action == "success" and session_id
+        else "overthink://paywall"
+    )
+    html = f"""<!doctype html>
+<html><head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Returning to Overthink This…</title>
+  <style>
+    body {{ font-family: -apple-system, Segoe UI, Roboto, sans-serif;
+            background: #F1ECE3; color: #161520;
+            display: flex; align-items: center; justify-content: center;
+            min-height: 100vh; margin: 0; padding: 0 24px; text-align: center; }}
+    .card {{ max-width: 360px; }}
+    h1 {{ font-size: 20px; margin: 0 0 8px; letter-spacing: -0.4px; }}
+    p  {{ font-size: 14px; color: #5A586B; margin: 0 0 18px; }}
+    a  {{ display: inline-block; padding: 12px 22px; background: #161520; color: #FFF;
+          text-decoration: none; border-radius: 999px; font-weight: 700; font-size: 14px; }}
+  </style>
+  <script>
+    window.location.replace({deep_link!r});
+    setTimeout(function() {{ document.getElementById('manual').style.display = 'inline-block'; }}, 1500);
+  </script>
+</head><body>
+  <div class="card">
+    <h1>Returning you to Overthink This…</h1>
+    <p>If the app doesn't open automatically, tap below.</p>
+    <a id="manual" href={deep_link!r} style="display:none;">Open the app</a>
+  </div>
+</body></html>"""
+    return HTMLResponse(content=html)
+
+
 @app.get("/api/payments/status/{session_id}")
 async def payment_status(session_id: str, user: dict = Depends(get_current_user)):
     if not STRIPE_API_KEY:
@@ -2255,7 +2291,7 @@ async def payment_status(session_id: str, user: dict = Depends(get_current_user)
     }
 
 
-@app.post("/api/webhook/stripe")
+@app.post("/api/payments/webhook")
 async def stripe_webhook(request: Request):
     if not STRIPE_API_KEY or not STRIPE_WEBHOOK_SECRET:
         raise HTTPException(503, "Stripe not configured")
