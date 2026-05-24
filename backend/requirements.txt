@@ -6,5 +6,3 @@ google-genai
 stripe
 httpx
 pydantic
-gunicorn
-uvicorn-worker
