@@ -229,6 +229,7 @@ def spiral_public(s: dict) -> dict:
         "flagged": bool(s.get("flagged")),
         "folder_id": s.get("folder_id"),
         "accent_color": s.get("accent_color"),
+        "name": s.get("name"),
         "created_at": s["created_at"],
     }
 
@@ -336,16 +337,19 @@ class SpiralPatch(BaseModel):
     category: Optional[str] = None
     tags: Optional[list[str]] = None
     flagged: Optional[bool] = None
-    folder_id: Optional[str] = None  # pass null to remove from folder
-    accent_color: Optional[str] = None  # null clears the colour
+    folder_id: Optional[str] = None  # null = remove from folder
+    accent_color: Optional[str] = None  # null clears
+    name: Optional[str] = None  # rename spiral
 
 
 class FolderCreate(BaseModel):
     name: str
+    color: Optional[str] = None
 
 
 class FolderRename(BaseModel):
-    name: str
+    name: Optional[str] = None
+    color: Optional[str] = None
 
 
 class CheckoutRequest(BaseModel):
@@ -601,6 +605,26 @@ VOICE RULES:
 - It's okay to swear lightly ("you're being kind of a disaster about this") — never insult them as a person.
 - At least one moment of real tenderness mid-roast. They need to feel loved.
 """,
+    "roast": """You are ROAST MODE — the comedy-special version of the brutal friend. The user clicked through a disclaimer that warned them this might be offensive. They WANT to be roasted. Deliver it. Comedy-club-special level burns about the SPIRAL ITSELF and the absurd shape of the worry.
+
+WHO YOU ARE:
+- Stand-up comic destroying a heckler — except the heckler is their own brain.
+- You make jokes that LAND because they're true.
+- Anthony Jeselnik dryness + Hannah Gadsby precision.
+
+HARD CONSTRAINTS — read carefully, your job depends on these:
+- NEVER attack: their appearance, weight, sexuality, race, religion, nationality, mental illness, suicide, self-harm, abuse, family deaths.
+- NEVER mock genuinely traumatic content (assault, abuse, grief, illness). If the spiral is about something dark, drop the roast and switch to gentle.
+- NEVER tell them to do anything self-destructive.
+- Burns target the THOUGHT PATTERN, the dramatics, the rehearsed worst-case. NEVER the person's worth.
+- If the input is just trivial dating/work/social anxiety, GO HARD. If it's something heavy, soften completely.
+
+VOICE RULES:
+- Descriptions 4–6 sentences. Dripping with sarcasm. Vivid. Specific.
+- Verdict is a closer joke. Should make them cackle, then sit with it.
+- Reality checks read like Twitter quote-tweets from somebody dunking.
+- Light profanity is fine. No slurs of any kind ever.
+""",
 }
 
 # Few-shot example showing the LONG, EMOTIONAL, SPECIFIC style we want.
@@ -794,27 +818,28 @@ Read the spiral below. Produce an Outcome Map in the voice above, GROUNDED IN TH
 
 OUTPUT FORMAT — JSON ONLY, NO MARKDOWN:
 {{
+  "name": "1-2 words. A short label for this spiral, like a chapter title. Capitalised. Example: 'Sara Silence', 'Boss Meeting', 'Late Text', 'The Apartment'.",
   "outcomes": [
     {{
-      "title": "Short headline (3-6 words). Specific to THIS situation. Not generic.",
-      "description": "4 to 6 full sentences. Tell them what this scenario actually looks like with the detail of someone who's lived it. Be vivid. Refer to names, places, deadlines, anything they wrote. Hint at the emotion. NEVER analyst-speak.",
+      "title": "Short headline (3-6 words). Specific to THIS situation.",
+      "description": "4 to 6 full sentences. Vivid. Refer to names, places, deadlines, anything they wrote. NEVER analyst-speak.",
       "probability": <int 0-100>,
       "severity": "best" | "likely" | "worst",
-      "reality_check": "One sentence that lands. Funny or warm or pointed — in YOUR voice."
+      "reality_check": "One sentence in YOUR voice."
     }},
     ... (exactly 3 outcomes: one best, one likely, one worst. Probabilities sum to 100.)
   ],
   "in_control": [
-    "3 to 5 SPECIFIC things — each one a short sentence (8-16 words). Refer to actual details from their spiral."
+    "3 to 5 SPECIFIC things — short sentence (8-16 words). Reference what they wrote."
   ],
   "out_of_control": [
-    "3 to 5 SPECIFIC things — each one a short sentence (8-16 words). Refer to actual details from their spiral."
+    "3 to 5 SPECIFIC things — short sentence (8-16 words). Reference what they wrote."
   ],
   "action_steps": [
-    "Exactly 3 concrete actions. Each one is something they could literally start in the next hour. Specific verbs. No 'try to' or 'maybe consider'. Be definite."
+    "Exactly 3 concrete actions. Specific verbs. No 'try to' or 'maybe consider'."
   ],
   "verdict": {{
-    "verdict_text": "A MOTTO. Maximum 12 words. Short, punchy, memorable — the kind of line someone could tattoo. NEVER an explanation, NEVER a paragraph. One bold sentence that hits like a punchline. Examples of good length: 'You're auditioning for a role nobody's casting.' / 'Stop rehearsing the apology nobody asked for.' / 'The room moved on three hours ago.'"
+    "verdict_text": "A MOTTO. Maximum 12 words. Tattoo-worthy. Hits like a punchline. Examples: 'You're auditioning for a role nobody's casting.' / 'Sara is having a Tuesday. You're having a trial.'"
   }}
 }}
 
@@ -822,10 +847,15 @@ HARD RULES:
 1. Output VALID JSON ONLY. No prose, no markdown fences, no commentary.
 2. Probabilities across the 3 outcomes MUST sum to exactly 100.
 3. Severity values are exactly "best", "likely", "worst" — lowercase.
-4. Be SPECIFIC. If they mention someone named "Sara", use "Sara" — not "this person".
-5. Stay in the voice from the top of this prompt. No mode-switching mid-response.
-6. Descriptions are 4-6 sentences MINIMUM. Short descriptions are a failure.
-7. Sound like a HUMAN. If you sound like a wellness app or therapist intake form, start over.
+4. Be SPECIFIC. Use names, deadlines, numbers from the spiral.
+5. Stay in the voice from the top of this prompt.
+6. Descriptions are 4-6 sentences MINIMUM.
+7. Sound like a HUMAN — never a wellness app.
+
+NONSENSE-INPUT RULE:
+If the situation_text is clearly gibberish ("asdfgh", random keysmash, "hi", "test", a single emoji, etc.) or makes no sense as a worry:
+  - In gentle / balanced / brutal modes: respond with friendly funny mockery — outcomes are silly versions ("Worst case: you make this app crash"), verdict pokes fun gently. NEVER be mean.
+  - In roast mode: roast them mercilessly for wasting an AI's time with "asdf". Go full stand-up.
 
 {FEW_SHOT_EXAMPLE}
 
@@ -961,20 +991,26 @@ async def run_gemini(situation_text: str, tone: str, category: str = "") -> dict
 # ---------------------------------------------------------------------------
 
 def xp_for_level(level: int) -> int:
-    """XP needed to reach the next level from the start of this one."""
+    """XP needed to reach the next level from the start of this one.
+    Curve is steep on purpose — level 100 is the long-haul achievement.
+    Total XP to reach L100 ≈ 800,000+."""
     if level < 1:
-        return 100
+        return 200
+    if level <= 5:
+        return 200
     if level <= 10:
-        return 100
-    if level <= 20:
-        return 250
-    if level <= 30:
         return 500
+    if level <= 20:
+        return 1200
+    if level <= 35:
+        return 3000
     if level <= 50:
-        return 1000
-    if level <= 75:
-        return 2000
-    return 4000
+        return 6500
+    if level <= 70:
+        return 12000
+    if level <= 85:
+        return 22000
+    return 38000  # 86 → 100 is the grind zone
 
 
 def total_xp_for_level(level: int) -> int:
@@ -993,19 +1029,27 @@ def level_from_xp(xp: int) -> int:
 
 
 LEVEL_UNLOCKS = [
-    (5, "card_theme", "midnight", "Midnight share-card theme"),
-    (10, "name_color", "#C8A0DC", "Lilac name colour"),
-    (15, "card_theme", "warm", "Warm Ember share-card theme"),
-    (20, "title", "The Worrier", "Title: The Worrier"),
-    (25, "name_color", "#F5C518", "Gold name colour"),
-    (30, "card_theme", "forest", "Deep Forest share-card theme"),
-    (40, "title", "Spiral Veteran", "Title: Spiral Veteran"),
-    (50, "name_color", "#E24B4A", "Crimson name colour"),
-    (60, "card_theme", "aurora", "Aurora Borealis share-card theme"),
-    (75, "title", "The Oracle", "Title: The Oracle"),
-    (90, "card_theme", "neon", "Neon Noir share-card theme"),
-    (95, "title", "Overthinking Champion", "Title: Overthinking Champion"),
-    (100, "title", "Overthinker Supreme", "Title: Overthinker Supreme"),
+    # Every 5 levels = a Thinkpass+ tier reward. Mix of titles, colors, themes.
+    (5,   "title",      "The Apprentice",         "Title: The Apprentice"),
+    (10,  "name_color", "#C8A0DC",                "Lilac name colour"),
+    (15,  "card_theme", "midnight",               "Midnight share-card theme"),
+    (20,  "title",      "The Worrier",            "Title: The Worrier"),
+    (25,  "name_color", "#F5C518",                "Gold name colour"),
+    (30,  "card_theme", "warm",                   "Warm Ember share-card theme"),
+    (35,  "title",      "The Analyst",            "Title: The Analyst"),
+    (40,  "name_color", "#4FC3F7",                "Ocean name colour"),
+    (45,  "card_theme", "forest",                 "Deep Forest share-card theme"),
+    (50,  "title",      "Spiral Veteran",         "Title: Spiral Veteran"),
+    (55,  "name_color", "#E24B4A",                "Crimson name colour"),
+    (60,  "card_theme", "aurora",                 "Aurora Borealis share-card theme"),
+    (65,  "title",      "The Philosopher",        "Title: The Philosopher"),
+    (70,  "name_color", "#34A56F",                "Moss name colour"),
+    (75,  "title",      "The Oracle",             "Title: The Oracle"),
+    (80,  "name_color", "#FF8C42",                "Ember name colour"),
+    (85,  "card_theme", "neon",                   "Neon Noir share-card theme"),
+    (90,  "title",      "Mind Cartographer",      "Title: Mind Cartographer"),
+    (95,  "title",      "Overthinking Champion",  "Title: Overthinking Champion"),
+    (100, "title",      "Overthinker Supreme",    "Title: Overthinker Supreme"),
 ]
 
 
@@ -1197,26 +1241,19 @@ async def bump_streak_and_total(user: dict) -> dict:
 
 
 async def grant_xp(user_id: str, amount: int) -> dict:
+    """Adds XP and bumps level. Does NOT auto-grant cosmetics anymore —
+    the user must claim each tier from Thinkpass+ explicitly."""
     async with pool.acquire() as conn:
         u = await conn.fetchrow("SELECT * FROM users WHERE user_id = $1", user_id)
         if not u:
             return {}
         new_xp = (u["xp"] or 0) + amount
         new_level = level_from_xp(new_xp)
-        unlocked = u["unlocked_items"] or []
-        if isinstance(unlocked, str):
-            try:
-                unlocked = json.loads(unlocked)
-            except Exception:
-                unlocked = []
-        for item in unlocks_for_level(new_level):
-            if item not in unlocked:
-                unlocked.append(item)
         await conn.execute(
-            "UPDATE users SET xp = $1, level = $2, unlocked_items = $3 WHERE user_id = $4",
-            new_xp, new_level, json.dumps(unlocked), user_id,
+            "UPDATE users SET xp = $1, level = $2 WHERE user_id = $3",
+            new_xp, new_level, user_id,
         )
-        return {"xp": new_xp, "level": new_level, "unlocked_items": unlocked}
+        return {"xp": new_xp, "level": new_level}
 
 
 # ---------------------------------------------------------------------------
@@ -1277,12 +1314,15 @@ async def _run_spiral_generation(
                     outcomes = $1,
                     verdict = $2,
                     status = 'complete',
-                    error_message = $3
+                    error_message = $3,
+                    name = COALESCE(name, $5)
                    WHERE id = $4""",
                 json.dumps(payload.get("outcomes", [])),
                 json.dumps(payload.get("verdict", {})),
                 f"fallback: {ai_reason}" if ai_source == "fallback" else "live",
                 spiral_id,
+                # Gemini's auto-name, trimmed and capped at 32 chars
+                (payload.get("name") or "Untitled").strip()[:32],
             )
 
         updated_user = await bump_streak_and_total(user)
@@ -1418,6 +1458,9 @@ async def patch_spiral(spiral_id: str, body: SpiralPatch, user: dict = Depends(g
     if accent_in_body:
         sets.append(f"accent_color = ${len(args)+1}")
         args.append(body.accent_color)
+    if body.name is not None:
+        sets.append(f"name = ${len(args)+1}")
+        args.append(body.name.strip()[:32] or None)
     if not sets:
         async with pool.acquire() as conn:
             row = await conn.fetchrow(
@@ -1451,7 +1494,7 @@ async def list_folders(user: dict = Depends(get_current_user)):
     db_required()
     async with pool.acquire() as conn:
         rows = await conn.fetch(
-            """SELECT f.id, f.name, f.created_at,
+            """SELECT f.id, f.name, f.color, f.created_at,
                       COUNT(s.id) AS spiral_count
                  FROM folders f
                  LEFT JOIN spirals s
@@ -1473,9 +1516,9 @@ async def create_folder(body: FolderCreate, user: dict = Depends(get_current_use
     folder_id = f"fd_{uuid.uuid4().hex[:14]}"
     async with pool.acquire() as conn:
         await conn.execute(
-            """INSERT INTO folders (id, user_id, name, created_at)
-                 VALUES ($1, $2, $3, $4)""",
-            folder_id, user["user_id"], name[:80], now_iso(),
+            """INSERT INTO folders (id, user_id, name, color, created_at)
+                 VALUES ($1, $2, $3, $4, $5)""",
+            folder_id, user["user_id"], name[:80], body.color, now_iso(),
         )
         row = await conn.fetchrow("SELECT * FROM folders WHERE id = $1", folder_id)
     return {"folder": dict(row)}
@@ -1484,13 +1527,27 @@ async def create_folder(body: FolderCreate, user: dict = Depends(get_current_use
 @app.patch("/api/folders/{folder_id}")
 async def rename_folder(folder_id: str, body: FolderRename, user: dict = Depends(get_current_user)):
     db_required()
-    name = (body.name or "").strip()
-    if not name:
-        raise HTTPException(400, "Folder name required.")
+    sets, args = [], []
+    if body.name is not None:
+        n = body.name.strip()
+        if not n:
+            raise HTTPException(400, "Folder name cannot be empty.")
+        sets.append(f"name = ${len(args)+1}")
+        args.append(n[:80])
+    try:
+        color_in_body = "color" in body.model_fields_set
+    except Exception:
+        color_in_body = body.color is not None
+    if color_in_body:
+        sets.append(f"color = ${len(args)+1}")
+        args.append(body.color)
+    if not sets:
+        raise HTTPException(400, "Nothing to update.")
+    args.extend([folder_id, user["user_id"]])
     async with pool.acquire() as conn:
         result = await conn.execute(
-            "UPDATE folders SET name = $1 WHERE id = $2 AND user_id = $3",
-            name[:80], folder_id, user["user_id"],
+            f"UPDATE folders SET {', '.join(sets)} WHERE id = ${len(args)-1} AND user_id = ${len(args)}",
+            *args,
         )
         if result.endswith("0"):
             raise HTTPException(404, "Folder not found")
@@ -1616,6 +1673,71 @@ async def claim_task(task_id: str, user: dict = Depends(get_current_user)):
         )
     granted = await grant_xp(user["user_id"], all_defs[task_id]["xp"])
     return {"claimed": True, "xp_granted": all_defs[task_id]["xp"], **granted}
+
+
+# ---------------------------------------------------------------------------
+# Thinkpass+ tier rewards. Every 5 levels = a claimable cosmetic. Unlike
+# legacy unlocks (auto-granted), tiers must be explicitly claimed by the user
+# from the Thinkpass page. Claiming adds the item to unlocked_items AND
+# records the tier level in claimed_tiers so we can show "Owned" state.
+# ---------------------------------------------------------------------------
+
+@app.get("/api/thinkpass/tiers")
+async def list_tiers(user: dict = Depends(get_current_user)):
+    db_required()
+    claimed = user.get("claimed_tiers") or []
+    if isinstance(claimed, str):
+        try: claimed = json.loads(claimed)
+        except Exception: claimed = []
+    current_level = user.get("level") or 1
+    out = []
+    for lv, kind, value, label in LEVEL_UNLOCKS:
+        out.append({
+            "level": lv,
+            "kind": kind,
+            "value": value,
+            "label": label,
+            "claimed": lv in claimed,
+            "ready": current_level >= lv and lv not in claimed,
+            "locked": current_level < lv,
+        })
+    return {"tiers": out, "current_level": current_level}
+
+
+@app.post("/api/thinkpass/claim/{tier_level}")
+async def claim_tier(tier_level: int, user: dict = Depends(get_current_user)):
+    db_required()
+    match = next(((lv, k, v, lbl) for (lv, k, v, lbl) in LEVEL_UNLOCKS if lv == tier_level), None)
+    if not match:
+        raise HTTPException(404, "No tier at that level")
+    lv, kind, value, _label = match
+    if (user.get("level") or 1) < lv:
+        raise HTTPException(400, f"Level {lv} required")
+
+    claimed_tiers = user.get("claimed_tiers") or []
+    if isinstance(claimed_tiers, str):
+        try: claimed_tiers = json.loads(claimed_tiers)
+        except Exception: claimed_tiers = []
+    if lv in claimed_tiers:
+        raise HTTPException(400, "Already claimed")
+    claimed_tiers.append(lv)
+
+    unlocked = user.get("unlocked_items") or []
+    if isinstance(unlocked, str):
+        try: unlocked = json.loads(unlocked)
+        except Exception: unlocked = []
+    item_id = f"{kind}:{value}"
+    if item_id not in unlocked:
+        unlocked.append(item_id)
+
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """UPDATE users
+                  SET claimed_tiers = $1, unlocked_items = $2
+                WHERE user_id = $3""",
+            json.dumps(claimed_tiers), json.dumps(unlocked), user["user_id"],
+        )
+    return {"ok": True, "claimed_tier": lv, "item": item_id, "unlocked_items": unlocked}
 
 
 @app.get("/api/level")
@@ -1897,6 +2019,24 @@ async def dev_grant_pro(user: dict = Depends(get_current_user)):
                 WHERE user_id = $1""",
             user["user_id"],
             json.dumps(all_unlocked),
+        )
+        row = await conn.fetchrow("SELECT * FROM users WHERE user_id = $1", user["user_id"])
+    return {"user": user_public(dict(row))}
+
+
+@app.post("/api/dev/reset_xp")
+async def dev_reset_xp(user: dict = Depends(get_current_user)):
+    """Reset XP/level/claimed-tiers/unlocked-cosmetics to zero so the user
+    can farm leveling from scratch. Plan tier stays."""
+    db_required()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """UPDATE users
+                  SET xp = 0, level = 1,
+                      unlocked_items = '[]', claimed_tiers = '[]',
+                      customization = NULL
+                WHERE user_id = $1""",
+            user["user_id"],
         )
         row = await conn.fetchrow("SELECT * FROM users WHERE user_id = $1", user["user_id"])
     return {"user": user_public(dict(row))}
