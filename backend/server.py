@@ -28,6 +28,9 @@ DATABASE_URL = os.environ.get("DATABASE_URL", "")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 STRIPE_API_KEY = os.environ.get("STRIPE_API_KEY", "")
 STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
+TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID", "")
+TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN", "")
+TWILIO_FROM_NUMBER = os.environ.get("TWILIO_FROM_NUMBER", "")
 GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
 CORS_ORIGINS_EXTRA = [o.strip() for o in os.environ.get("CORS_ORIGINS", "").split(",") if o.strip()]
 
@@ -518,6 +521,26 @@ async def update_customization(body: CustomizeRequest, user: dict = Depends(get_
 # Phone OTP (dev — no SMS provider, OTP logged to console)
 # ---------------------------------------------------------------------------
 
+async def _send_sms_via_twilio(to_number: str, body_text: str) -> tuple[bool, str]:
+    """Returns (success, info). Doesn't raise — caller decides whether the
+    OTP attempt should still 'succeed' if SMS dispatch failed."""
+    if not (TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN and TWILIO_FROM_NUMBER):
+        return False, "twilio_not_configured"
+    url = f"https://api.twilio.com/2010-04-01/Accounts/{TWILIO_ACCOUNT_SID}/Messages.json"
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(
+                url,
+                auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN),
+                data={"From": TWILIO_FROM_NUMBER, "To": to_number, "Body": body_text},
+            )
+        if 200 <= resp.status_code < 300:
+            return True, "sent"
+        return False, f"twilio_{resp.status_code}: {resp.text[:200]}"
+    except Exception as exc:
+        return False, f"twilio_exception: {type(exc).__name__}: {exc}"
+
+
 @app.post("/api/auth/phone/send")
 async def phone_send(body: PhoneSendRequest, user: dict = Depends(get_current_user)):
     import random
@@ -528,8 +551,21 @@ async def phone_send(body: PhoneSendRequest, user: dict = Depends(get_current_us
             "INSERT INTO phone_otps (user_id, phone_number, otp, expires_at, created_at) VALUES ($1,$2,$3,$4,$5)",
             user["user_id"], body.phone_number, otp, expires, now_iso(),
         )
-    print(f"[OTP] {body.phone_number} -> {otp} (expires {expires})")
-    return {"ok": True, "message": "OTP sent", "dev_otp": otp}
+
+    sent, info = await _send_sms_via_twilio(
+        body.phone_number,
+        f"Your Overthink This code is {otp}. Expires in {OTP_TTL_MINUTES} minutes.",
+    )
+    print(f"[OTP] {body.phone_number} -> {otp} ({'SMS sent' if sent else f'NO SMS ({info})'})")
+
+    # When Twilio isn't configured (yet — no FROM_NUMBER), still return the
+    # OTP in the response so dev/testing isn't blocked. Once a real
+    # FROM_NUMBER is set in prod env vars, dev_otp won't be exposed.
+    out: dict = {"ok": True, "message": "OTP sent" if sent else "OTP generated (no SMS)"}
+    if not sent:
+        out["dev_otp"] = otp
+        out["debug"] = info
+    return out
 
 
 @app.post("/api/auth/phone/verify")
