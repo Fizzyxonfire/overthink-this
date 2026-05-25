@@ -1338,42 +1338,25 @@ _TEXT_CHECK_COLUMNS_READY = False
 
 @app.post("/api/text-check")
 async def text_check(body: TextCheckRequest, user: dict = Depends(get_current_user)):
-    """Pre-send draft analyzer. Returns three predicted responses + a
-    verdict + optional rewrite. Free tier capped at FREE_TEXT_CHECK_MONTHLY
-    per calendar month (UTC); Pro is unlimited."""
-    global _TEXT_CHECK_COLUMNS_READY
+    """Pre-send draft analyzer — Pro-only. Returns three predicted
+    responses + a verdict + optional rewrite. Free users get a 403
+    with a clear "upgrade" message; the frontend routes that to the
+    paywall instead of showing an error."""
     db_required()
     if user.get("is_guest"):
         raise HTTPException(403, "Sign in to use Text-Check")
+    is_pro_user = (user.get("plan_tier") or "free") in {"pro_weekly", "pro_monthly", "pro_yearly", "lifetime"}
+    if not is_pro_user:
+        # Pro-only. The frontend listens for 403 here and routes to the
+        # paywall — the message is what shows in the alert until the
+        # paywall opens.
+        raise HTTPException(403, "Text-Check is a Pro feature. Upgrade for unlimited drafts.")
+
     draft = (body.draft or "").strip()
     if not draft:
         raise HTTPException(400, "Draft is empty")
     if len(draft) > 4000:
         raise HTTPException(400, "Draft is too long (4000 char max)")
-
-    is_pro_user = (user.get("plan_tier") or "free") in {"pro_weekly", "pro_monthly", "pro_yearly", "lifetime"}
-    if not _TEXT_CHECK_COLUMNS_READY:
-        try:
-            await _ensure_text_check_columns()
-            _TEXT_CHECK_COLUMNS_READY = True
-        except Exception as exc:
-            print(f"[text-check] column-ensure failed (non-fatal): {exc}")
-
-    this_month = datetime.now(timezone.utc).strftime("%Y-%m")
-    used_this_month = 0
-    if not is_pro_user:
-        async with pool.acquire() as conn:
-            row = await conn.fetchrow(
-                "SELECT text_checks_month, text_checks_count FROM users WHERE user_id = $1",
-                user["user_id"],
-            )
-        if row and row["text_checks_month"] == this_month:
-            used_this_month = row["text_checks_count"] or 0
-        if used_this_month >= FREE_TEXT_CHECK_MONTHLY:
-            raise HTTPException(
-                402,
-                f"Free tier limit reached ({FREE_TEXT_CHECK_MONTHLY}/month). Upgrade for unlimited.",
-            )
 
     result = await run_text_check(
         draft=draft,
@@ -1381,29 +1364,13 @@ async def text_check(body: TextCheckRequest, user: dict = Depends(get_current_us
         relationship=body.relationship or "someone",
     )
 
-    # Bump the counter only on a successful AI call (not fallback) so a
-    # backend outage doesn't burn the user's free quota.
-    if not is_pro_user and result.get("_ai_source") == "live":
-        async with pool.acquire() as conn:
-            await conn.execute(
-                """UPDATE users
-                     SET text_checks_month = $1,
-                         text_checks_count = CASE
-                            WHEN text_checks_month = $1 THEN COALESCE(text_checks_count, 0) + 1
-                            ELSE 1
-                         END
-                   WHERE user_id = $2""",
-                this_month, user["user_id"],
-            )
-        used_this_month += 1
-
     return {
         "result": result,
         "usage": {
-            "is_pro": is_pro_user,
-            "used_this_month": used_this_month,
-            "monthly_limit": None if is_pro_user else FREE_TEXT_CHECK_MONTHLY,
-            "remaining": None if is_pro_user else max(0, FREE_TEXT_CHECK_MONTHLY - used_this_month),
+            "is_pro": True,
+            "used_this_month": 0,
+            "monthly_limit": None,
+            "remaining": None,
         },
     }
 
@@ -1818,15 +1785,17 @@ async def get_spiral(spiral_id: str, user: dict = Depends(get_current_user)):
     if not row:
         raise HTTPException(404, "Spiral not found")
     spiral = spiral_public(dict(row))
-    # Compute pattern_context on the fly — finds past spirals in the
-    # same category with ≥ 0.34 Jaccard tag overlap (same heuristic as
-    # /api/insights/loops). Cheap enough for a single-spiral GET that
-    # we don't bother caching it. Recomputed on every read so the
-    # "last resolution" stays fresh as the user resolves more spirals.
-    spiral["pattern_context"] = await _compute_pattern_context(
-        user_id=user["user_id"],
-        current_spiral=dict(row),
-    )
+    # Pattern Alerts (feature #5) — Pro-only. We skip the compute for
+    # free users so they never see the "this is the Nth time" banner.
+    # Frontend treats a null pattern_context as "no pattern".
+    is_pro_user = (user.get("plan_tier") or "free") in {"pro_weekly", "pro_monthly", "pro_yearly", "lifetime"}
+    if is_pro_user:
+        spiral["pattern_context"] = await _compute_pattern_context(
+            user_id=user["user_id"],
+            current_spiral=dict(row),
+        )
+    else:
+        spiral["pattern_context"] = None
     return {"spiral": spiral}
 
 
@@ -2678,6 +2647,29 @@ async def insights_score(user: dict = Depends(get_current_user)):
     """
     db_required()
     is_pro_user = (user.get("plan_tier") or "free") in {"pro_weekly", "pro_monthly", "pro_yearly", "lifetime"}
+    # Hard-lock for free users — skip the aggregation entirely. We still
+    # return total_spirals so the upsell hero can show "you have N
+    # receipts to tally — Pro unlocks the score". Everything else is
+    # null and the frontend renders the locked hero.
+    if not is_pro_user:
+        async with pool.acquire() as conn:
+            count_row = await conn.fetchrow(
+                "SELECT COUNT(*) AS n FROM spirals WHERE user_id = $1 AND status = 'complete'",
+                user["user_id"],
+            )
+        return {
+            "total_spirals": (count_row["n"] if count_row else 0),
+            "resolved_count": 0,
+            "worst_case_avoided_pct": None,
+            "resolution_breakdown": {},
+            "best_tone": None,
+            "worst_category": None,
+            "best_category": None,
+            "plot_twist_count": 0,
+            "share_line": "Unlock the receipts with Pro.",
+            "is_pro": False,
+            "preview_only": True,
+        }
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             """SELECT category, tone_used, resolved, resolution_status
@@ -2795,6 +2787,23 @@ async def insights_loops(user: dict = Depends(get_current_user)):
     """
     db_required()
     is_pro_user = (user.get("plan_tier") or "free") in {"pro_weekly", "pro_monthly", "pro_yearly", "lifetime"}
+    # Hard-lock for free users — we don't even run the clustering.
+    # Frontend uses is_pro=false to render the Pro upsell hero.
+    # total_spirals is still returned so the upsell can say something
+    # honest like "you have 47 spirals — Pro turns them into patterns".
+    if not is_pro_user:
+        async with pool.acquire() as conn:
+            count_row = await conn.fetchrow(
+                "SELECT COUNT(*) AS n FROM spirals WHERE user_id = $1 AND status = 'complete'",
+                user["user_id"],
+            )
+        return {
+            "loops": [],
+            "min_spirals_needed": 3,
+            "total_spirals": (count_row["n"] if count_row else 0),
+            "is_pro": False,
+            "preview_only": True,
+        }
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             """SELECT id, category, tags, situation_text, resolved,
@@ -2806,21 +2815,14 @@ async def insights_loops(user: dict = Depends(get_current_user)):
         )
     spirals = [dict(r) for r in rows]
     clusters = [c for c in _cluster_spirals(spirals) if len(c) >= 3]
-    # Sort by count desc, then by recency of the most recent spiral.
-    def _sort_key(cl):
-        max_dt = max((s.get("created_at") or "" for s in cl), default="")
-        return (-len(cl), -ord(max_dt[0]) if max_dt else 0)
     clusters.sort(key=lambda cl: (-len(cl), -(len(cl[0].get("created_at") or ""))))
     loops = [_summarise_loop(cl) for cl in clusters[:8]]
     return {
         "loops": loops,
         "min_spirals_needed": 3,
         "total_spirals": len(spirals),
-        "is_pro": is_pro_user,
-        # The frontend uses this to decide whether to blur loops [1:].
-        # We don't strip the data server-side because the user owns it —
-        # gating is purely visual / UX.
-        "preview_only": not is_pro_user,
+        "is_pro": True,
+        "preview_only": False,
     }
 
 
