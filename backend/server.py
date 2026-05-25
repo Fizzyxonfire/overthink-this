@@ -64,6 +64,19 @@ async def lifespan(_: FastAPI):
             statement_cache_size=0,  # pooler-friendly
             ssl="require" if needs_ssl else None,
         )
+        # Idempotent column adds for fields added after the initial schema.
+        # Safe to re-run on every boot — IF NOT EXISTS makes it a no-op once
+        # the column is in place. Avoids needing a manual migration step.
+        try:
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    "ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_customer_id TEXT"
+                )
+                await conn.execute(
+                    "ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_subscription_id TEXT"
+                )
+        except Exception as exc:
+            print(f"[lifespan] column-add migration warning: {exc}")
     yield
     if pool:
         await pool.close()
@@ -647,12 +660,20 @@ VOICE RULES:
 - It's okay to swear lightly ("you're being kind of a disaster about this") — never insult them as a person.
 - At least one moment of real tenderness mid-roast. They need to feel loved.
 """,
-    "roast": """You are ROAST MODE — the comedy-special version of the brutal friend. The user clicked through a disclaimer that warned them this might be offensive. They WANT to be roasted. Deliver it. Comedy-club-special level burns about the SPIRAL ITSELF and the absurd shape of the worry.
+    "roast": """You are ROAST MODE. The user explicitly clicked through a disclaimer asking to be roasted. Do not soften this. Do not be nice. Do not be supportive. This is a comedy-club roast set written about their thought pattern — and they paid the cover charge.
 
 WHO YOU ARE:
-- Stand-up comic destroying a heckler — except the heckler is their own brain.
-- You make jokes that LAND because they're true.
-- Anthony Jeselnik dryness + Hannah Gadsby precision.
+- A merciless stand-up comic mid-set. The heckler is the user's brain.
+- Bo Burnham's self-aware spite + Anthony Jeselnik's deadpan + Daniel Sloss's surgical precision.
+- You sound NOTHING like the other tones. The gentle/balanced/brutal versions could be a wellness coach having a bad day. You are not that. You are a person who finds this spiral genuinely, audibly funny.
+
+MANDATORY VOICE MARKERS (your response MUST sound different from the other tones):
+- Open at least ONE outcome with a deadpan callout: "Oh, this one's incredible." / "Wait, you actually said this out loud?" / "I want to frame this." / "Genuinely my favourite kind of spiral."
+- The verdict MUST be a punchline. It should make someone reading over their shoulder laugh out loud. Examples: "You've been workshopping a tragedy for an audience of one." / "Congratulations, you're the lead in a one-act play nobody wrote." / "Sara is brushing her teeth. You're writing her closing argument."
+- Reality checks are short, dry dunks. Treat them like quote-tweets. "Sir, this is a Wendy's." / "Babe, log off." / "You're not in a movie."
+- Use second person and accusations directly: "you're rehearsing" / "you're catastrophising" / "you're auditioning"
+- ALLOWED: light profanity ("damn", "what the hell", "shit"), sarcasm, callouts of the specific dramatic moves they made.
+- VOCAB BAN — words you cannot use because they sound like the other tones: "honey", "I know", "okay so", "listen", "look", "of course", "I get it", "it's okay", "warm", "soft", "tenderness".
 
 HARD CONSTRAINTS — read carefully, your job depends on these:
 - NEVER attack: their appearance, weight, sexuality, race, religion, nationality, mental illness, suicide, self-harm, abuse, family deaths.
@@ -662,10 +683,9 @@ HARD CONSTRAINTS — read carefully, your job depends on these:
 - If the input is just trivial dating/work/social anxiety, GO HARD. If it's something heavy, soften completely.
 
 VOICE RULES:
-- Descriptions 4–6 sentences. Dripping with sarcasm. Vivid. Specific.
+- Descriptions 4–6 sentences. Sarcastic. Vivid. Specific to what they wrote — names, numbers, exact phrases.
 - Verdict is a closer joke. Should make them cackle, then sit with it.
-- Reality checks read like Twitter quote-tweets from somebody dunking.
-- Light profanity is fine. No slurs of any kind ever.
+- One moment of accidental tenderness mid-roast is allowed (one — not three). Earn it.
 """,
 }
 
@@ -892,6 +912,13 @@ ANTI-PATTERN RULES (read carefully — break the AI mold):
 - Probability numbers should NOT always be round (55/30/15). Mix — sometimes 47/38/15, sometimes 60/25/15. Whatever the situation actually feels like.
 - Reference random small things they wrote (a time, a name, a specific object) and make THEM the anchor of one description.
 - Vary description length WITHIN the response — one can be 4 sentences, another 6. Don't be metronome-uniform.
+
+TONE-MATCH ENFORCEMENT (critical — your output must FEEL like the tone you were assigned):
+- If tone is "roast": at least ONE outcome description must contain biting sarcasm or a direct dunk on the dramatic move the user made. The verdict MUST be a punchline that lands like a comedy-club closer. If your draft sounds gentle, warm, or supportive, rewrite it harder.
+- If tone is "gentle": at least ONE outcome description must explicitly acknowledge how the worry FEELS. The verdict should land soft, like a hand on the shoulder — not a punchline.
+- If tone is "brutal": exactly ONE moment of warmth mid-roast; the rest is dry sibling energy.
+- If tone is "balanced": one piece of wit per response, otherwise honest and grounded.
+- Two responses from different tones for the same situation should be UNMISTAKABLY different in voice — a reader could blind-guess which tone was used.
 
 OUTPUT FORMAT — JSON ONLY, NO MARKDOWN:
 {{
@@ -2207,13 +2234,29 @@ def stripe_lib():
 
 @app.post("/api/payments/checkout")
 async def create_checkout(body: CheckoutRequest, user: dict = Depends(get_current_user)):
+    # Top-level try/except so NO unhandled exception ever escapes as a
+    # generic 500. Every failure path is logged with a [create_checkout]
+    # prefix and returned as a 502 with the real reason in the body.
+    try:
+        return await _create_checkout_inner(body, user)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        import traceback
+        tb = traceback.format_exc()
+        print(f"[create_checkout] UNHANDLED {type(exc).__name__}: {exc}\n{tb}")
+        raise HTTPException(502, f"Checkout failed ({type(exc).__name__}): {exc}")
+
+
+async def _create_checkout_inner(body: CheckoutRequest, user: dict):
+    print(f"[create_checkout] start user={user.get('user_id')} guest={user.get('is_guest')} pkg={body.package_id}")
     if user.get("is_guest"):
         raise HTTPException(403, "Sign in before upgrading")
     pkg = PACKAGES.get(body.package_id)
     if not pkg:
         raise HTTPException(400, "Unknown package")
     if not STRIPE_API_KEY:
-        raise HTTPException(503, "Stripe not configured")
+        raise HTTPException(503, "Stripe not configured (STRIPE_API_KEY missing)")
     stripe = stripe_lib()
     # Stripe rejects custom-scheme URLs. Route through our own HTTPS bridge
     # that immediately redirects to the app's deep link.
@@ -2354,10 +2397,35 @@ async def apply_plan(session_id: str, session: Optional[dict] = None) -> dict:
             expires = (datetime.now(timezone.utc) + timedelta(days=7)).isoformat()
         elif tier == "pro_monthly":
             expires = (datetime.now(timezone.utc) + timedelta(days=30)).isoformat()
-        await conn.execute(
-            "UPDATE users SET plan_tier = $1, plan_expires_at = $2 WHERE user_id = $3",
-            tier, expires, tx["user_id"],
-        )
+        # Capture the Stripe customer + subscription IDs so we can later
+        # open the billing portal for cancellation. session.customer is a
+        # string id on most checkout sessions; subscription is set on
+        # subscription-mode sessions only.
+        cust_id = None
+        sub_id = None
+        if session is not None:
+            cust_id = (
+                session.get("customer") if isinstance(session, dict)
+                else getattr(session, "customer", None)
+            )
+            sub_id = (
+                session.get("subscription") if isinstance(session, dict)
+                else getattr(session, "subscription", None)
+            )
+        if cust_id or sub_id:
+            await conn.execute(
+                """UPDATE users
+                     SET plan_tier = $1, plan_expires_at = $2,
+                         stripe_customer_id = COALESCE($3, stripe_customer_id),
+                         stripe_subscription_id = COALESCE($4, stripe_subscription_id)
+                   WHERE user_id = $5""",
+                tier, expires, cust_id, sub_id, tx["user_id"],
+            )
+        else:
+            await conn.execute(
+                "UPDATE users SET plan_tier = $1, plan_expires_at = $2 WHERE user_id = $3",
+                tier, expires, tx["user_id"],
+            )
         await conn.execute(
             """UPDATE payment_transactions SET plan_applied = TRUE,
                                                 applied_at = $1,
@@ -2521,6 +2589,26 @@ async def stripe_webhook(request: Request):
     # has payment_status=paid by then; one-time always does). The async
     # invoice.payment_succeeded covers the rare case where the first
     # subscription invoice settles slightly after the session completes.
+    # Subscription cancelled (manually or by failed payment) → drop the
+    # user back to free. We look them up by stripe_subscription_id which we
+    # stored at apply_plan time.
+    if et == "customer.subscription.deleted":
+        sub = event["data"]["object"]
+        sub_id = sub.get("id") if isinstance(sub, dict) else getattr(sub, "id", None)
+        if sub_id:
+            try:
+                async with pool.acquire() as conn:
+                    await conn.execute(
+                        """UPDATE users SET plan_tier = 'free', plan_expires_at = NULL,
+                                            stripe_subscription_id = NULL
+                           WHERE stripe_subscription_id = $1""",
+                        sub_id,
+                    )
+                print(f"[webhook] subscription {sub_id} deleted → user reverted to free")
+            except Exception as exc:
+                print(f"[webhook] failed to revert user for sub {sub_id}: {exc}")
+        return {"received": True}
+
     if et in {"checkout.session.completed", "checkout.session.async_payment_succeeded"}:
         session = event["data"]["object"]
         mode = session.get("mode")
@@ -2537,6 +2625,71 @@ async def stripe_webhook(request: Request):
             except Exception as exc:
                 print(f"[webhook] apply_plan failed for {session.get('id')}: {exc}")
     return {"received": True}
+
+
+@app.get("/api/payments/diag")
+async def payments_diag():
+    """Diagnostic endpoint — visible without auth so we can hit it from a
+    browser to verify Stripe is reachable from this server. Returns the
+    Stripe key prefix (NOT the full key) and the result of a no-op API
+    call to confirm the key is valid for the current Stripe mode."""
+    out: dict = {
+        "stripe_key_present": bool(STRIPE_API_KEY),
+        "stripe_key_prefix": (STRIPE_API_KEY[:8] + "…") if STRIPE_API_KEY else None,
+        "stripe_key_is_test": STRIPE_API_KEY.startswith("sk_test_") if STRIPE_API_KEY else None,
+        "stripe_key_is_live": STRIPE_API_KEY.startswith("sk_live_") if STRIPE_API_KEY else None,
+        "webhook_secret_present": bool(STRIPE_WEBHOOK_SECRET),
+        "db_pool_ready": pool is not None,
+    }
+    if not STRIPE_API_KEY:
+        out["stripe_ok"] = False
+        out["stripe_error"] = "No STRIPE_API_KEY env var on server"
+        return out
+    try:
+        stripe = stripe_lib()
+        # Cheapest possible call: just list 1 product to confirm the key
+        # authenticates against the right Stripe account.
+        stripe.Product.list(limit=1)
+        out["stripe_ok"] = True
+    except Exception as exc:
+        out["stripe_ok"] = False
+        out["stripe_error"] = f"{type(exc).__name__}: {exc}"
+    return out
+
+
+@app.post("/api/payments/portal")
+async def billing_portal(user: dict = Depends(get_current_user)):
+    """Create a Stripe Billing Portal session — the user gets a URL where
+    they can manage / cancel their subscription. We pre-stored the
+    customer_id at apply_plan time. Returns 400 if the user has no
+    associated Stripe customer (e.g. they're free or on a guest account)."""
+    if user.get("is_guest"):
+        raise HTTPException(403, "Sign in to manage your subscription")
+    if not STRIPE_API_KEY:
+        raise HTTPException(503, "Stripe not configured")
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT stripe_customer_id, plan_tier FROM users WHERE user_id = $1",
+            user["user_id"],
+        )
+    cust_id = row["stripe_customer_id"] if row else None
+    if not cust_id:
+        raise HTTPException(400, "No subscription on file")
+    # The portal redirects back here when the user is done. Routes through
+    # the HTTPS bridge → app deep link the same way checkout does.
+    base_https = "https://overthink-this-api.onrender.com"
+    return_url = f"{base_https}/api/payments/return?action=cancel"
+    try:
+        stripe = stripe_lib()
+        portal = stripe.billing_portal.Session.create(
+            customer=cust_id,
+            return_url=return_url,
+        )
+    except Exception as exc:
+        detail = getattr(exc, "user_message", None) or str(exc)
+        print(f"[billing_portal] Stripe rejected portal create: {type(exc).__name__}: {detail}")
+        raise HTTPException(502, f"Stripe error: {detail}")
+    return {"url": portal.url}
 
 
 # ---------------------------------------------------------------------------
