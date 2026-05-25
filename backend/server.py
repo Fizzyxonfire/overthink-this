@@ -2233,6 +2233,39 @@ def stripe_lib():
     return _stripe
 
 
+def _stripe_to_dict(obj) -> dict:
+    """Coerce a stripe-python response (StripeObject, dict, or None) into a
+    plain dict so call sites can use .get() / [key] without worrying about
+    SDK version differences.
+
+    Newer stripe-python (≥ 7.x) made StripeObject stop inheriting from
+    dict, so direct .get() now triggers __getattr__ → AttributeError. The
+    SDK exposes to_dict_recursive() for this exact case; older versions
+    expose to_dict(). Fall back to the object's __dict__ as a last resort.
+    """
+    if obj is None:
+        return {}
+    if isinstance(obj, dict):
+        return obj
+    for meth in ("to_dict_recursive", "to_dict"):
+        fn = getattr(obj, meth, None)
+        if callable(fn):
+            try:
+                d = fn()
+                if isinstance(d, dict):
+                    return d
+            except Exception:
+                pass
+    # Last resort — most StripeObjects keep their fields in _previous or
+    # the bare __dict__. This won't deep-resolve nested StripeObjects but
+    # at least gives us top-level keys.
+    try:
+        return dict(obj)  # works if it does subclass dict on this SDK ver
+    except Exception:
+        return {k: v for k, v in getattr(obj, "__dict__", {}).items()
+                if not k.startswith("_")}
+
+
 @app.post("/api/payments/checkout")
 async def create_checkout(body: CheckoutRequest, user: dict = Depends(get_current_user)):
     # Top-level try/except so NO unhandled exception ever escapes as a
@@ -2389,7 +2422,10 @@ async def apply_plan(session_id: str, session: Optional[dict] = None) -> dict:
                 except Exception as exc:
                     print(f"[apply_plan] Stripe retrieve failed for {session_id}: {exc}")
                     raise HTTPException(502, f"Stripe retrieve failed: {exc}")
-            meta = (session.get("metadata") or {}) if isinstance(session, dict) else (getattr(session, "metadata", {}) or {})
+            # Normalise session to a plain dict — see _stripe_to_dict
+            # docstring for why. metadata is a nested StripeObject too.
+            sd = _stripe_to_dict(session)
+            meta = _stripe_to_dict(sd.get("metadata"))
             user_id = meta.get("user_id")
             package_id = meta.get("package_id")
             if not user_id or not package_id:
@@ -2431,14 +2467,9 @@ async def apply_plan(session_id: str, session: Optional[dict] = None) -> dict:
         cust_id = None
         sub_id = None
         if session is not None:
-            cust_id = (
-                session.get("customer") if isinstance(session, dict)
-                else getattr(session, "customer", None)
-            )
-            sub_id = (
-                session.get("subscription") if isinstance(session, dict)
-                else getattr(session, "subscription", None)
-            )
+            sd2 = _stripe_to_dict(session)
+            cust_id = sd2.get("customer")
+            sub_id = sd2.get("subscription")
         if cust_id or sub_id:
             await conn.execute(
                 """UPDATE users
@@ -2538,9 +2569,15 @@ async def payment_status(session_id: str, user: dict = Depends(get_current_user)
         fetch_error = f"Stripe retrieve failed: {exc}"
         print(f"[payment_status] {fetch_error} (session {session_id})")
 
-    payment_status_v = (session or {}).get("payment_status") if session else None
-    sess_status      = (session or {}).get("status") if session else None
-    mode             = (session or {}).get("mode") if session else None
+    # Normalise to a plain dict — newer stripe-python (≥ 7.x) no longer
+    # exposes .get() on StripeObject; accessing .get triggers __getattr__
+    # which raises AttributeError. Going through dict() (or .to_dict() /
+    # to_dict_recursive) gives us a vanilla dict we can interrogate
+    # safely without per-version SDK guesswork.
+    session_d = _stripe_to_dict(session) if session else {}
+    payment_status_v = session_d.get("payment_status")
+    sess_status      = session_d.get("status")
+    mode             = session_d.get("mode")
 
     # A subscription is considered active once status == "complete" (Stripe
     # has charged the first invoice). A one-time payment uses payment_status.
@@ -2591,7 +2628,7 @@ async def payment_status(session_id: str, user: dict = Depends(get_current_user)
         "payment_status": payment_status_v,
         "status": sess_status,
         "mode": mode,
-        "amount_total": (session or {}).get("amount_total") if session else None,
+        "amount_total": session_d.get("amount_total"),
         "applied": applied or user_is_pro,
         "user_plan_tier": user_plan_tier,
         "error": fetch_error or apply_error,
@@ -2610,7 +2647,13 @@ async def stripe_webhook(request: Request):
     except Exception as exc:
         raise HTTPException(400, f"Bad signature: {exc}")
 
-    et = event.get("type")
+    # Coerce the whole event to a plain dict — same reasoning as the
+    # _stripe_to_dict helper. Lets us treat events from any stripe-python
+    # version uniformly with [] / .get().
+    event_d = _stripe_to_dict(event)
+    et = event_d.get("type")
+    data_obj = _stripe_to_dict(_stripe_to_dict(event_d.get("data")).get("object"))
+
     # Both events indicate "user paid" — checkout.session.completed fires
     # right after the user finishes checkout (subscription mode usually
     # has payment_status=paid by then; one-time always does). The async
@@ -2620,8 +2663,7 @@ async def stripe_webhook(request: Request):
     # user back to free. We look them up by stripe_subscription_id which we
     # stored at apply_plan time.
     if et == "customer.subscription.deleted":
-        sub = event["data"]["object"]
-        sub_id = sub.get("id") if isinstance(sub, dict) else getattr(sub, "id", None)
+        sub_id = data_obj.get("id")
         if sub_id:
             try:
                 async with pool.acquire() as conn:
@@ -2637,20 +2679,21 @@ async def stripe_webhook(request: Request):
         return {"received": True}
 
     if et in {"checkout.session.completed", "checkout.session.async_payment_succeeded"}:
-        session = event["data"]["object"]
-        mode = session.get("mode")
-        pstatus = session.get("payment_status")
-        sstatus = session.get("status")
+        session_d = data_obj  # already dict-coerced above
+        mode = session_d.get("mode")
+        pstatus = session_d.get("payment_status")
+        sstatus = session_d.get("status")
+        sid = session_d.get("id")
         is_paid = (
             pstatus == "paid"
             or pstatus == "no_payment_required"
             or (mode == "subscription" and sstatus == "complete")
         )
-        if is_paid:
+        if is_paid and sid:
             try:
-                await apply_plan(session["id"], session=session)
+                await apply_plan(sid, session=session_d)
             except Exception as exc:
-                print(f"[webhook] apply_plan failed for {session.get('id')}: {exc}")
+                print(f"[webhook] apply_plan failed for {sid}: {exc}")
     return {"received": True}
 
 
