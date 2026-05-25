@@ -2250,6 +2250,8 @@ async def create_checkout(body: CheckoutRequest, user: dict = Depends(get_curren
 
 
 async def _create_checkout_inner(body: CheckoutRequest, user: dict):
+    import asyncio, time
+    t0 = time.monotonic()
     print(f"[create_checkout] start user={user.get('user_id')} guest={user.get('is_guest')} pkg={body.package_id}")
     if user.get("is_guest"):
         raise HTTPException(403, "Sign in before upgrading")
@@ -2259,6 +2261,7 @@ async def _create_checkout_inner(body: CheckoutRequest, user: dict):
     if not STRIPE_API_KEY:
         raise HTTPException(503, "Stripe not configured (STRIPE_API_KEY missing)")
     stripe = stripe_lib()
+    print(f"[create_checkout] +{time.monotonic()-t0:.2f}s stripe_lib ready")
     # Stripe rejects custom-scheme URLs. Route through our own HTTPS bridge
     # that immediately redirects to the app's deep link.
     base_https = "https://overthink-this-api.onrender.com"
@@ -2296,7 +2299,23 @@ async def _create_checkout_inner(body: CheckoutRequest, user: dict):
         }
 
     try:
-        session = stripe.checkout.Session.create(**create_kwargs)
+        # stripe-python is SYNCHRONOUS — calling it directly inside an
+        # async endpoint blocks the asyncio event loop. On a 0.1 CPU
+        # Render instance with cold-start latency, that can push the
+        # whole request past Render's ~100s timeout and the client sees
+        # a 500 with no body. asyncio.to_thread moves the blocking call
+        # to the default thread pool so the loop stays responsive.
+        # Also wrap in a 25s timeout — if Stripe is slow, fail loud
+        # instead of letting Render kill the whole request.
+        print(f"[create_checkout] +{time.monotonic()-t0:.2f}s calling Stripe…")
+        session = await asyncio.wait_for(
+            asyncio.to_thread(stripe.checkout.Session.create, **create_kwargs),
+            timeout=25.0,
+        )
+        print(f"[create_checkout] +{time.monotonic()-t0:.2f}s Stripe returned session={session.id}")
+    except asyncio.TimeoutError:
+        print(f"[create_checkout] Stripe call timed out after 25s (event loop / network)")
+        raise HTTPException(504, "Stripe took too long to respond. Try again in a few seconds.")
     except Exception as exc:
         # Surface the real Stripe error message + type so the app shows a
         # specific reason instead of an opaque 500. stripe-python's errors
@@ -2316,24 +2335,31 @@ async def _create_checkout_inner(body: CheckoutRequest, user: dict):
     # a DB hiccup block returning the checkout URL — the user has a valid
     # Stripe session and can still pay; the webhook / polling endpoint will
     # heal the missing row via apply_plan's metadata-reconstruction path.
+    # 5s timeout on the DB write so a stuck pool can't take down checkout.
     try:
         if pool is None:
             print(f"[create_checkout] pool is None — skipping tx insert for session {session.id}")
         else:
-            async with pool.acquire() as conn:
-                await conn.execute(
-                    """INSERT INTO payment_transactions
-                         (session_id, user_id, package_id, amount, currency, metadata, payment_status, status, created_at)
-                       VALUES ($1,$2,$3,$4,$5,$6,'initiated','open',$7)
-                       ON CONFLICT (session_id) DO NOTHING""",
-                    session.id, user["user_id"], pkg["id"], pkg["amount"], pkg["currency"],
-                    json.dumps({"package": pkg}), now_iso(),
-                )
+            async def _ins():
+                async with pool.acquire() as conn:
+                    await conn.execute(
+                        """INSERT INTO payment_transactions
+                             (session_id, user_id, package_id, amount, currency, metadata, payment_status, status, created_at)
+                           VALUES ($1,$2,$3,$4,$5,$6,'initiated','open',$7)
+                           ON CONFLICT (session_id) DO NOTHING""",
+                        session.id, user["user_id"], pkg["id"], pkg["amount"], pkg["currency"],
+                        json.dumps({"package": pkg}), now_iso(),
+                    )
+            await asyncio.wait_for(_ins(), timeout=5.0)
+            print(f"[create_checkout] +{time.monotonic()-t0:.2f}s tx row inserted")
+    except asyncio.TimeoutError:
+        print(f"[create_checkout] DB insert TIMED OUT for session {session.id} — continuing (apply_plan will heal)")
     except Exception as exc:
         # Don't blow up the checkout — log loudly and keep going. apply_plan
         # will reconstruct the row from Stripe metadata when the user returns.
         print(f"[create_checkout] DB insert failed for session {session.id}: {type(exc).__name__}: {exc}")
 
+    print(f"[create_checkout] DONE +{time.monotonic()-t0:.2f}s url={session.url[:80]}…")
     return {"url": session.url, "session_id": session.id}
 
 
