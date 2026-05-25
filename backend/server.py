@@ -2250,6 +2250,133 @@ def _summarise_loop(cluster: list) -> dict:
     }
 
 
+@app.get("/api/insights/score")
+async def insights_score(user: dict = Depends(get_current_user)):
+    """Loop Resolution Score — your personal "your brain was wrong N%
+    of the time" report card. Aggregated across every resolved spiral
+    the user has.
+
+    Response shape:
+      {
+        "total_spirals": int,
+        "resolved_count": int,
+        # The headline stat. Higher = your worst-case predictions
+        # mostly didn't come true (good news, brain is wrong a lot).
+        "worst_case_avoided_pct": int | null,
+        # Granular resolution breakdown (one of: resolved / not_resolved /
+        # plot_twist_good / plot_twist_bad / other).
+        "resolution_breakdown": { ... },
+        # Pro-only: where your brain was most wrong vs. most right.
+        "best_tone": str | null,
+        "worst_category": str | null,   # category with highest miss rate
+        "best_category": str | null,    # category with most correct predictions
+        "plot_twist_count": int,
+        "share_line": str,              # one-liner ready for the share card
+        "is_pro": bool,
+        "preview_only": bool,
+      }
+    """
+    db_required()
+    is_pro_user = (user.get("plan_tier") or "free") in {"pro_weekly", "pro_monthly", "lifetime"}
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT category, tone_used, resolved, resolution_status
+               FROM spirals
+               WHERE user_id = $1 AND status = 'complete'""",
+            user["user_id"],
+        )
+    spirals = [dict(r) for r in rows]
+    total = len(spirals)
+
+    # A spiral counts as "resolved" if it has any resolution_status
+    # (resolved / not_resolved / plot_twist_good / plot_twist_bad / other).
+    # The resolved boolean column is older + redundant, so we treat any
+    # resolution_status as truth.
+    from collections import Counter
+    res_counter: Counter = Counter()
+    # Category-level miss tracking: per-category counts of correct vs.
+    # wrong predictions. "Correct prediction" = your worst-case did NOT
+    # come true → resolved as resolved / plot_twist_good.
+    cat_right: Counter = Counter()
+    cat_wrong: Counter = Counter()
+    tone_right: Counter = Counter()
+    tone_total: Counter = Counter()
+    plot_twist_count = 0
+
+    for s in spirals:
+        rs = s.get("resolution_status")
+        if not rs:
+            continue
+        res_counter[rs] += 1
+        is_right = rs in {"resolved", "plot_twist_good"}
+        is_wrong = rs in {"not_resolved", "plot_twist_bad"}
+        if rs in {"plot_twist_good", "plot_twist_bad"}:
+            plot_twist_count += 1
+        cat = s.get("category") or "other"
+        tone = s.get("tone_used") or "balanced"
+        if is_right:
+            cat_right[cat] += 1
+        if is_wrong:
+            cat_wrong[cat] += 1
+        if is_right:
+            tone_right[tone] += 1
+        if is_right or is_wrong:
+            tone_total[tone] += 1
+
+    resolved_count = sum(res_counter.values())
+    right_count = sum(cat_right.values())
+    decisive_count = right_count + sum(cat_wrong.values())
+    worst_case_avoided_pct = (
+        round((right_count / decisive_count) * 100) if decisive_count > 0 else None
+    )
+
+    # Per-category miss rate (lower = your worry rate of return is good).
+    # We only consider categories with ≥ 2 resolutions to avoid one-shot
+    # noise pretending to be a pattern.
+    def _cat_miss_rate(cat: str) -> float:
+        r, w = cat_right[cat], cat_wrong[cat]
+        total_cat = r + w
+        return (w / total_cat) if total_cat >= 2 else -1.0  # -1 → ignore
+
+    cats_decisive = [c for c in set(list(cat_right) + list(cat_wrong)) if _cat_miss_rate(c) >= 0]
+    worst_category = max(cats_decisive, key=_cat_miss_rate) if cats_decisive else None
+    best_category = min(cats_decisive, key=_cat_miss_rate) if cats_decisive else None
+
+    # Most-trusted tone: highest "right rate" with ≥ 2 resolutions.
+    def _tone_right_rate(t: str) -> float:
+        total_t = tone_total[t]
+        return (tone_right[t] / total_t) if total_t >= 2 else -1.0
+    tones_decisive = [t for t in tone_total if _tone_right_rate(t) >= 0]
+    best_tone = max(tones_decisive, key=_tone_right_rate) if tones_decisive else None
+
+    # Build a punchy one-line headline for the share card. Falls back
+    # gracefully when there aren't enough resolutions to compute it.
+    if worst_case_avoided_pct is None:
+        share_line = "Still tracking — resolve more spirals to see your number."
+    elif worst_case_avoided_pct >= 70:
+        share_line = f"My brain was wrong {worst_case_avoided_pct}% of the time."
+    elif worst_case_avoided_pct >= 50:
+        share_line = f"My worst case missed more than it landed ({worst_case_avoided_pct}%)."
+    else:
+        share_line = f"My brain was actually right {100 - worst_case_avoided_pct}% of the time. Rude."
+
+    return {
+        "total_spirals": total,
+        "resolved_count": resolved_count,
+        "worst_case_avoided_pct": worst_case_avoided_pct,
+        "resolution_breakdown": dict(res_counter),
+        "best_tone": best_tone,
+        "worst_category": worst_category,
+        "best_category": best_category,
+        "plot_twist_count": plot_twist_count,
+        "share_line": share_line,
+        "is_pro": is_pro_user,
+        # Free users see the headline %, total count, and the share
+        # line. Per-category / per-tone breakdown stays behind preview_only.
+        "preview_only": not is_pro_user,
+    }
+
+
 @app.get("/api/insights/loops")
 async def insights_loops(user: dict = Depends(get_current_user)):
     """Surface the user's recurring overthinking patterns.
