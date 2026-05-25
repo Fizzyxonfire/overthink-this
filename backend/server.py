@@ -1140,6 +1140,275 @@ async def run_gemini(situation_text: str, tone: str, category: str = "") -> dict
 
 
 # ---------------------------------------------------------------------------
+# Text-Check ("Don't send that text") — pre-send draft analyzer
+#
+# Distinct from the spiral pipeline: takes a draft message the user is
+# about to send and predicts how the recipient is likely to respond.
+# Returns best/likely/worst predicted reply + a verdict (SEND / WAIT /
+# REWRITE) + an optional softer rewrite suggestion. Free users get a
+# monthly cap; Pro is unlimited.
+# ---------------------------------------------------------------------------
+
+# Per-month cap for free users. The full Pro upgrade prompt is in the
+# frontend — backend just enforces the wall.
+FREE_TEXT_CHECK_MONTHLY = 3
+
+
+def _build_text_check_prompt(*, draft: str, context: str, relationship: str) -> str:
+    """Compose the Gemini prompt for the pre-send analyzer. Returns a
+    string ready to send to client.models.generate_content.
+
+    The prompt explicitly forbids platitudes ("trust your gut" etc) and
+    asks for tonal specifics — that's what makes the response feel like
+    a sharp friend's read instead of a chatbot's hedge.
+    """
+    rel = relationship.strip() if relationship else "someone"
+    ctx_line = f"\nContext from the sender (what's been happening): \"\"\"{context.strip()}\"\"\"" if context.strip() else ""
+    return f"""You are reading a draft message someone is about to send to {rel}. Your job: predict three plausible responses (best case, most likely, worst case) and give a one-line VERDICT on whether to send, wait, or rewrite.
+
+ANTI-PATTERN RULES — read carefully:
+- DO NOT say "trust your gut" or "go with your heart" or other platitudes.
+- DO NOT use the words "anxious", "spiral", "overthinking" in the response.
+- DO NOT hedge ("it depends"). Pick a verdict and own it.
+- DO NOT moralise about the relationship dynamics.
+
+YOUR JOB:
+1. Read the draft below.
+2. Predict three plausible responses from the recipient, each grounded in the actual content and tone of the draft.
+3. Give a single VERDICT: SEND / WAIT / REWRITE.
+4. If verdict is REWRITE, propose a softer/sharper version of the draft (1–2 sentences max).
+
+OUTPUT FORMAT — JSON ONLY, NO MARKDOWN:
+{{
+  "predicted_responses": [
+    {{
+      "severity": "best",
+      "title": "Short headline (3–6 words). Specific.",
+      "reply_text": "A plausible 1–2 sentence response in {rel}'s voice.",
+      "probability": <int 0-100>,
+      "what_it_means": "One sentence — what this response would tell you."
+    }},
+    {{ "severity": "likely",  ... }},
+    {{ "severity": "worst",   ... }}
+  ],
+  "verdict": "SEND" | "WAIT" | "REWRITE",
+  "verdict_reason": "ONE sentence explaining the verdict. No hedging.",
+  "rewrite_suggestion": "<string OR null — only when verdict is REWRITE>",
+  "tone_read": "ONE sentence on how the draft will READ to {rel} (e.g. 'reads needy', 'reads cold', 'reads warm but assumes too much')."
+}}
+
+HARD RULES:
+1. Output VALID JSON ONLY. No prose, no markdown fences.
+2. probabilities across the 3 predicted_responses MUST sum to exactly 100.
+3. severity values are exactly "best", "likely", "worst" — lowercase.
+4. rewrite_suggestion is REQUIRED when verdict == "REWRITE", otherwise null.
+5. Be SPECIFIC. Quote phrases from the draft when helpful.
+
+NOW DO IT FOR THIS DRAFT:
+Sending to: {rel}{ctx_line}
+
+DRAFT TEXT:
+\"\"\"{draft.strip()}\"\"\"
+
+Respond with JSON only.
+"""
+
+
+def _text_check_fallback(reason: str) -> dict:
+    """Offline / Gemini-down fallback. Honest about being a placeholder."""
+    return {
+        "predicted_responses": [
+            {"severity": "best",   "title": "Warm reply",            "reply_text": "They respond positively and the conversation moves on.", "probability": 30, "what_it_means": "Best case — no harm done."},
+            {"severity": "likely", "title": "Polite acknowledgement", "reply_text": "They say something brief but don't engage with the deeper point.", "probability": 50, "what_it_means": "Most likely — the message lands but doesn't open the conversation you wanted."},
+            {"severity": "worst",  "title": "Cool distance",          "reply_text": "They don't reply, or reply curtly. You spend the night re-reading the thread.", "probability": 20, "what_it_means": "Worst case — the silence becomes its own message."},
+        ],
+        "verdict": "WAIT",
+        "verdict_reason": "AI is offline — sleep on it and re-check tomorrow.",
+        "rewrite_suggestion": None,
+        "tone_read": "Couldn't read the tone — Gemini is unreachable.",
+        "_ai_source": f"fallback: {reason}",
+    }
+
+
+async def run_text_check(*, draft: str, context: str, relationship: str) -> dict:
+    """Call Gemini with the pre-send prompt. Mirrors run_gemini's
+    fallback discipline — model-rotation across GEMINI_MODELS, JSON
+    cleanup, loud logging, and an offline-safe fallback."""
+    if not GEMINI_API_KEY:
+        print("[text-check] no GEMINI_API_KEY — using fallback")
+        return _text_check_fallback("no_api_key")
+    try:
+        from google import genai
+        from google.genai import types as gen_types
+        client = genai.Client(api_key=GEMINI_API_KEY)
+        config = gen_types.GenerateContentConfig(
+            temperature=1.05,
+            top_p=0.95,
+            top_k=40,
+            max_output_tokens=2048,
+            response_mime_type="application/json",
+        )
+        prompt = _build_text_check_prompt(draft=draft, context=context, relationship=relationship)
+        text = ""
+        last_error: Optional[Exception] = None
+        for model_name in GEMINI_MODELS:
+            try:
+                print(f"[text-check] trying {model_name}…")
+                resp = await client.aio.models.generate_content(
+                    model=model_name, contents=prompt, config=config,
+                )
+                text = (resp.text or "").strip()
+                if text:
+                    print(f"[text-check] ✅ {model_name} returned {len(text)} chars")
+                    break
+            except Exception as me:
+                last_error = me
+                print(f"[text-check] {model_name} failed: {type(me).__name__}: {str(me)[:160]}")
+                continue
+        if not text:
+            raise last_error or ValueError("All Gemini models failed")
+        if text.startswith("```"):
+            text = text.strip("`")
+            if text.lower().startswith("json"):
+                text = text[4:]
+        try:
+            data = json.loads(text)
+        except Exception:
+            # Reuse the same newline-escape salvage as the spiral path.
+            data = json.loads(_best_effort_json_cleanup(text))
+
+        # Normalise + sanity-check the shape.
+        responses = data.get("predicted_responses") or []
+        if not isinstance(responses, list) or len(responses) != 3:
+            raise ValueError("predicted_responses must be a list of 3")
+        # Re-normalise probabilities to sum to exactly 100 (Gemini sometimes drifts ±1).
+        total = sum(int(r.get("probability", 0)) for r in responses) or 1
+        for r in responses:
+            r["probability"] = round(int(r.get("probability", 0)) * 100 / total)
+        # Round-off correction: shove the residual onto the "likely" bucket.
+        drift = 100 - sum(r["probability"] for r in responses)
+        if drift != 0:
+            likely = next((r for r in responses if r.get("severity") == "likely"), responses[0])
+            likely["probability"] = max(0, min(100, likely["probability"] + drift))
+        data["predicted_responses"] = responses
+
+        v = (data.get("verdict") or "WAIT").upper()
+        if v not in {"SEND", "WAIT", "REWRITE"}:
+            v = "WAIT"
+        data["verdict"] = v
+        data.setdefault("verdict_reason", "Take a beat before sending.")
+        data.setdefault("tone_read", "")
+        if v != "REWRITE":
+            data["rewrite_suggestion"] = None
+        else:
+            data["rewrite_suggestion"] = data.get("rewrite_suggestion") or None
+        data["_ai_source"] = "live"
+        return data
+    except Exception as exc:
+        import traceback
+        print(f"[text-check] ❌ FALLBACK — {type(exc).__name__}: {exc}")
+        traceback.print_exc()
+        return _text_check_fallback(f"{type(exc).__name__}: {str(exc)[:120]}")
+
+
+class TextCheckRequest(BaseModel):
+    draft: str
+    context: Optional[str] = ""
+    relationship: Optional[str] = "someone"
+
+
+async def _ensure_text_check_columns():
+    """Idempotent: create the text_checks usage-counter columns on
+    users so we can enforce FREE_TEXT_CHECK_MONTHLY without a separate
+    table. Runs lazily on the first call rather than in lifespan so
+    the column add stays close to the feature using it."""
+    if pool is None:
+        return
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS text_checks_month TEXT"
+        )
+        await conn.execute(
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS text_checks_count INTEGER DEFAULT 0"
+        )
+
+
+_TEXT_CHECK_COLUMNS_READY = False
+
+
+@app.post("/api/text-check")
+async def text_check(body: TextCheckRequest, user: dict = Depends(get_current_user)):
+    """Pre-send draft analyzer. Returns three predicted responses + a
+    verdict + optional rewrite. Free tier capped at FREE_TEXT_CHECK_MONTHLY
+    per calendar month (UTC); Pro is unlimited."""
+    global _TEXT_CHECK_COLUMNS_READY
+    db_required()
+    if user.get("is_guest"):
+        raise HTTPException(403, "Sign in to use Text-Check")
+    draft = (body.draft or "").strip()
+    if not draft:
+        raise HTTPException(400, "Draft is empty")
+    if len(draft) > 4000:
+        raise HTTPException(400, "Draft is too long (4000 char max)")
+
+    is_pro_user = (user.get("plan_tier") or "free") in {"pro_weekly", "pro_monthly", "lifetime"}
+    if not _TEXT_CHECK_COLUMNS_READY:
+        try:
+            await _ensure_text_check_columns()
+            _TEXT_CHECK_COLUMNS_READY = True
+        except Exception as exc:
+            print(f"[text-check] column-ensure failed (non-fatal): {exc}")
+
+    this_month = datetime.now(timezone.utc).strftime("%Y-%m")
+    used_this_month = 0
+    if not is_pro_user:
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT text_checks_month, text_checks_count FROM users WHERE user_id = $1",
+                user["user_id"],
+            )
+        if row and row["text_checks_month"] == this_month:
+            used_this_month = row["text_checks_count"] or 0
+        if used_this_month >= FREE_TEXT_CHECK_MONTHLY:
+            raise HTTPException(
+                402,
+                f"Free tier limit reached ({FREE_TEXT_CHECK_MONTHLY}/month). Upgrade for unlimited.",
+            )
+
+    result = await run_text_check(
+        draft=draft,
+        context=body.context or "",
+        relationship=body.relationship or "someone",
+    )
+
+    # Bump the counter only on a successful AI call (not fallback) so a
+    # backend outage doesn't burn the user's free quota.
+    if not is_pro_user and result.get("_ai_source") == "live":
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """UPDATE users
+                     SET text_checks_month = $1,
+                         text_checks_count = CASE
+                            WHEN text_checks_month = $1 THEN COALESCE(text_checks_count, 0) + 1
+                            ELSE 1
+                         END
+                   WHERE user_id = $2""",
+                this_month, user["user_id"],
+            )
+        used_this_month += 1
+
+    return {
+        "result": result,
+        "usage": {
+            "is_pro": is_pro_user,
+            "used_this_month": used_this_month,
+            "monthly_limit": None if is_pro_user else FREE_TEXT_CHECK_MONTHLY,
+            "remaining": None if is_pro_user else max(0, FREE_TEXT_CHECK_MONTHLY - used_this_month),
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
 # XP / Level / Task system
 # ---------------------------------------------------------------------------
 
