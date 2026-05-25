@@ -88,6 +88,20 @@ async def lifespan(_: FastAPI):
                 await conn.execute(
                     "ALTER TABLE users ADD COLUMN IF NOT EXISTS spiral_frequency TEXT"
                 )
+                # First-time pricing — once any Pro tier ever applies
+                # for this user, the paywall stops showing the
+                # "FIRST-TIME OFFER" strikethrough. Backend prices
+                # don't change; this is purely a UX gate.
+                await conn.execute(
+                    "ALTER TABLE users ADD COLUMN IF NOT EXISTS has_ever_subscribed BOOLEAN DEFAULT FALSE"
+                )
+                # Feature #10 — Spiral Soundtrack. A 2-line anthem
+                # generated alongside each spiral. Stored as JSONB so
+                # we can add fields later (vibe tag, hashtags) without
+                # another migration. Pro-only at display time.
+                await conn.execute(
+                    "ALTER TABLE spirals ADD COLUMN IF NOT EXISTS soundtrack JSONB"
+                )
         except Exception as exc:
             print(f"[lifespan] column-add migration warning: {exc}")
     yield
@@ -221,6 +235,9 @@ def user_public(u: dict) -> dict:
         "bio": u.get("bio") or None,
         "personality": u.get("personality") or None,
         "spiral_frequency": u.get("spiral_frequency") or None,
+        # Drives the "FIRST-TIME OFFER" strikethrough on the paywall —
+        # any returning subscriber sees the real price with no discount.
+        "has_ever_subscribed": bool(u.get("has_ever_subscribed")),
         "created_at": u.get("created_at"),
     }
 
@@ -244,6 +261,12 @@ def spiral_public(s: dict) -> dict:
             tags = json.loads(tags)
         except Exception:
             tags = []
+    soundtrack = s.get("soundtrack")
+    if isinstance(soundtrack, str):
+        try:
+            soundtrack = json.loads(soundtrack)
+        except Exception:
+            soundtrack = None
     return {
         "id": s["id"],
         "user_id": s["user_id"],
@@ -259,6 +282,7 @@ def spiral_public(s: dict) -> dict:
         "share_count": s.get("share_count") or 0,
         "outcomes": outcomes,
         "verdict": verdict,
+        "soundtrack": soundtrack,
         "error_message": s.get("error_message"),
         "flagged": bool(s.get("flagged")),
         "folder_id": s.get("folder_id"),
@@ -983,6 +1007,11 @@ OUTPUT FORMAT — JSON ONLY, NO MARKDOWN:
   ],
   "verdict": {{
     "verdict_text": "A MOTTO. Maximum 12 words. Tattoo-worthy. Hits like a punchline. Examples: 'You're auditioning for a role nobody's casting.' / 'Sara is having a Tuesday. You're having a trial.'"
+  }},
+  "soundtrack": {{
+    "title": "An invented 'song title' for THIS spiral. 3–6 words. Album-art energy. Examples: 'Late-Night Sara Edition', 'Boss Meeting Blues', 'The Group Chat Cold Open', 'I Did Not Need To Send That'.",
+    "line_1": "First line of the 'anthem'. 6–10 words. Reads like a song lyric — rhythmic, vivid, mildly funny. Anchored in the spiral's specifics (names, numbers, the actual situation). NO clichés.",
+    "line_2": "Second line. Builds on or undercuts line 1. 6–10 words. Either rhymes with line 1 or hits a different rhythm. Lands like the chorus."
   }}
 }}
 
@@ -1697,6 +1726,20 @@ async def _run_spiral_generation(
         ai_source = payload.get("_ai_source", "unknown")
         ai_reason = payload.get("_ai_reason")
 
+        # Soundtrack — only persist if Gemini returned a well-shaped
+        # object. Fallback paths skip it (the field is optional and the
+        # frontend renders nothing if it's null).
+        soundtrack_obj = payload.get("soundtrack")
+        soundtrack_json = None
+        if isinstance(soundtrack_obj, dict):
+            t = (soundtrack_obj.get("title") or "").strip()
+            l1 = (soundtrack_obj.get("line_1") or "").strip()
+            l2 = (soundtrack_obj.get("line_2") or "").strip()
+            if t and l1 and l2:
+                soundtrack_json = json.dumps({
+                    "title": t[:60], "line_1": l1[:120], "line_2": l2[:120],
+                })
+
         async with pool.acquire() as conn:
             await conn.execute(
                 """UPDATE spirals SET
@@ -1704,14 +1747,15 @@ async def _run_spiral_generation(
                     verdict = $2,
                     status = 'complete',
                     error_message = $3,
-                    name = COALESCE(name, $5)
+                    name = COALESCE(name, $5),
+                    soundtrack = $6
                    WHERE id = $4""",
                 json.dumps(payload.get("outcomes", [])),
                 json.dumps(payload.get("verdict", {})),
                 f"fallback: {ai_reason}" if ai_source == "fallback" else "live",
                 spiral_id,
-                # Gemini's auto-name, trimmed and capped at 32 chars
                 (payload.get("name") or "Untitled").strip()[:32],
+                soundtrack_json,
             )
 
         updated_user = await bump_streak_and_total(user)
@@ -1785,9 +1829,8 @@ async def get_spiral(spiral_id: str, user: dict = Depends(get_current_user)):
     if not row:
         raise HTTPException(404, "Spiral not found")
     spiral = spiral_public(dict(row))
-    # Pattern Alerts (feature #5) — Pro-only. We skip the compute for
-    # free users so they never see the "this is the Nth time" banner.
-    # Frontend treats a null pattern_context as "no pattern".
+    # Pattern Alerts (#5) + Spiral Soundtrack (#10) — both Pro-only.
+    # Strip / skip for free users so the frontend has nothing to render.
     is_pro_user = (user.get("plan_tier") or "free") in {"pro_weekly", "pro_monthly", "pro_yearly", "lifetime"}
     if is_pro_user:
         spiral["pattern_context"] = await _compute_pattern_context(
@@ -1796,6 +1839,7 @@ async def get_spiral(spiral_id: str, user: dict = Depends(get_current_user)):
         )
     else:
         spiral["pattern_context"] = None
+        spiral["soundtrack"] = None
     return {"spiral": spiral}
 
 
@@ -2833,12 +2877,11 @@ async def insights_loops(user: dict = Depends(get_current_user)):
 PACKAGES = {
     "weekly":  {"id": "weekly",  "label": "Spiral Starter",      "amount": 1.99,  "currency": "usd", "tier": "pro_weekly"},
     "monthly": {"id": "monthly", "label": "Deep In My Feelings", "amount": 5.99,  "currency": "usd", "tier": "pro_monthly"},
-    # Annual plan — billed once per year, treated as Pro for the whole
-    # year. Tier "pro_yearly" so isPro() in the frontend keeps working.
-    # Apply_plan sets plan_expires_at to now+365d on activation.
-    "yearly":  {"id": "yearly",  "label": "Year of Quiet",       "amount": 39.99, "currency": "usd", "tier": "pro_yearly"},
     "lifetime":{"id": "lifetime","label": "Infinite Loop Pass",  "amount": 29.99, "currency": "usd", "tier": "lifetime"},
 }
+# NOTE: pro_yearly tier handling is kept downstream (apply_plan,
+# isPro checks) for back-compat in case any user briefly bought it
+# before this revert. New checkouts can't reach it.
 
 
 # ---------------------------------------------------------------------------
@@ -3220,18 +3263,26 @@ async def apply_plan(session_id: str, session: Optional[dict] = None) -> dict:
             sd2 = _stripe_to_dict(session)
             cust_id = sd2.get("customer")
             sub_id = sd2.get("subscription")
+        # has_ever_subscribed sticks to TRUE the first time any Pro
+        # tier applies — driver for the "no more first-time discount"
+        # gate on the paywall. Never reset (even on cancellation), so
+        # a churned-and-returning user pays the real price.
         if cust_id or sub_id:
             await conn.execute(
                 """UPDATE users
                      SET plan_tier = $1, plan_expires_at = $2,
                          stripe_customer_id = COALESCE($3, stripe_customer_id),
-                         stripe_subscription_id = COALESCE($4, stripe_subscription_id)
+                         stripe_subscription_id = COALESCE($4, stripe_subscription_id),
+                         has_ever_subscribed = TRUE
                    WHERE user_id = $5""",
                 tier, expires, cust_id, sub_id, tx["user_id"],
             )
         else:
             await conn.execute(
-                "UPDATE users SET plan_tier = $1, plan_expires_at = $2 WHERE user_id = $3",
+                """UPDATE users
+                     SET plan_tier = $1, plan_expires_at = $2,
+                         has_ever_subscribed = TRUE
+                   WHERE user_id = $3""",
                 tier, expires, tx["user_id"],
             )
         await conn.execute(
