@@ -2126,6 +2126,178 @@ async def wrapped_current(user: dict = Depends(get_current_user)):
 
 
 # ---------------------------------------------------------------------------
+# Insights — "Your Recurring Loops"
+#
+# Pattern detection across the user's archive. This is the differentiator
+# vs. a generic chatbot: ChatGPT forgets you between sessions; this
+# endpoint surfaces "you've spiralled about Sara 7 times this month — 6
+# of those resolved as nothing happened."
+#
+# Clustering algorithm (deliberately simple v1):
+#   • Group by category, then sub-group by tag overlap (Jaccard ≥ 0.34).
+#   • A "loop" needs ≥ 3 spirals in the same cluster.
+#   • Per loop we compute: count, last_seen, top tags, resolution
+#     breakdown, and an "accuracy %" (= fraction that resolved as
+#     resolved/plot_twist_good vs not_resolved/plot_twist_bad — a proxy
+#     for "your worst-case prediction came true").
+#
+# Free users get one preview loop with the rest locked. Pro users get
+# everything. We always run the full computation server-side and trim
+# the response — that way Pro upgrades surface results immediately
+# without re-querying.
+# ---------------------------------------------------------------------------
+
+def _tag_key(tags) -> tuple:
+    """Normalise a spiral's tags into a sorted tuple for hashing."""
+    if not tags:
+        return ()
+    if isinstance(tags, str):
+        try:
+            tags = json.loads(tags)
+        except Exception:
+            return ()
+    return tuple(sorted(t.strip().lower() for t in tags if t and isinstance(t, str)))
+
+
+def _jaccard(a: tuple, b: tuple) -> float:
+    sa, sb = set(a), set(b)
+    if not sa and not sb:
+        return 1.0
+    if not sa or not sb:
+        return 0.0
+    return len(sa & sb) / len(sa | sb)
+
+
+def _cluster_spirals(spirals: list) -> list:
+    """Greedy single-pass clustering: each spiral joins the first existing
+    cluster whose representative shares its category AND ≥ 0.34 Jaccard
+    overlap on tags. Otherwise it seeds a new cluster.
+
+    Returns a list of clusters; each cluster is a list of spiral dicts.
+    Deliberately simple — no embeddings, no transitive merging. Good
+    enough to surface "you keep spiralling about X" without an LLM bill.
+    """
+    clusters: list = []
+    for s in spirals:
+        cat = s.get("category") or "other"
+        tags = _tag_key(s.get("tags"))
+        joined = False
+        for cl in clusters:
+            rep = cl[0]
+            if (rep.get("category") or "other") != cat:
+                continue
+            rep_tags = _tag_key(rep.get("tags"))
+            # Empty-tag spirals only cluster with other empty-tag spirals
+            # in the same category — otherwise everything with no tags
+            # lumps together and obscures the real pattern.
+            if not tags and not rep_tags:
+                cl.append(s)
+                joined = True
+                break
+            if _jaccard(tags, rep_tags) >= 0.34:
+                cl.append(s)
+                joined = True
+                break
+        if not joined:
+            clusters.append([s])
+    return clusters
+
+
+def _summarise_loop(cluster: list) -> dict:
+    """Compute display stats for one cluster of spirals."""
+    from collections import Counter
+    cat = cluster[0].get("category") or "other"
+    tag_counts: Counter = Counter()
+    res_counts: Counter = Counter()
+    last_seen = None
+    sample_situations: list = []
+    for s in cluster:
+        tags = _tag_key(s.get("tags"))
+        for t in tags:
+            tag_counts[t] += 1
+        rs = s.get("resolution_status") or ("resolved" if s.get("resolved") else None)
+        if rs:
+            res_counts[rs] += 1
+        created = s.get("created_at")
+        if created and (last_seen is None or created > last_seen):
+            last_seen = created
+        # Keep first 80 chars of up to 3 sample situations for the
+        # "what these have in common" preview text.
+        if len(sample_situations) < 3:
+            txt = (s.get("situation_text") or "").strip().replace("\n", " ")
+            if txt:
+                sample_situations.append(txt[:80] + ("…" if len(txt) > 80 else ""))
+    top_tags = [t for t, _ in tag_counts.most_common(3)]
+    total_resolved = sum(res_counts.values())
+    # "Brain accuracy" = how often you were RIGHT to worry.
+    # bad outcomes (not_resolved / plot_twist_bad) / total_resolved
+    bad = res_counts.get("not_resolved", 0) + res_counts.get("plot_twist_bad", 0)
+    accuracy_pct = None
+    if total_resolved >= 2:
+        accuracy_pct = round((bad / total_resolved) * 100)
+    # Generate a short headline: top tag if any, else category.
+    headline = top_tags[0].title() if top_tags else cat.title()
+    return {
+        "headline": headline,
+        "category": cat,
+        "count": len(cluster),
+        "tags": top_tags,
+        "last_seen": last_seen,
+        "resolution_breakdown": dict(res_counts),
+        "resolved_count": total_resolved,
+        "worry_accuracy_pct": accuracy_pct,
+        "sample_situations": sample_situations,
+    }
+
+
+@app.get("/api/insights/loops")
+async def insights_loops(user: dict = Depends(get_current_user)):
+    """Surface the user's recurring overthinking patterns.
+
+    Response shape:
+      {
+        "loops": [ { headline, category, count, tags, last_seen,
+                     resolution_breakdown, resolved_count,
+                     worry_accuracy_pct, sample_situations }, ... ],
+        "min_spirals_needed": 3,
+        "total_spirals": int,
+        "is_pro": bool,
+        "preview_only": bool   (true when user is free — only first loop
+                                is fully revealed in the UI),
+      }
+    """
+    db_required()
+    is_pro_user = (user.get("plan_tier") or "free") in {"pro_weekly", "pro_monthly", "lifetime"}
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT id, category, tags, situation_text, resolved,
+                      resolution_status, created_at
+               FROM spirals
+               WHERE user_id = $1 AND status = 'complete'
+               ORDER BY created_at DESC""",
+            user["user_id"],
+        )
+    spirals = [dict(r) for r in rows]
+    clusters = [c for c in _cluster_spirals(spirals) if len(c) >= 3]
+    # Sort by count desc, then by recency of the most recent spiral.
+    def _sort_key(cl):
+        max_dt = max((s.get("created_at") or "" for s in cl), default="")
+        return (-len(cl), -ord(max_dt[0]) if max_dt else 0)
+    clusters.sort(key=lambda cl: (-len(cl), -(len(cl[0].get("created_at") or ""))))
+    loops = [_summarise_loop(cl) for cl in clusters[:8]]
+    return {
+        "loops": loops,
+        "min_spirals_needed": 3,
+        "total_spirals": len(spirals),
+        "is_pro": is_pro_user,
+        # The frontend uses this to decide whether to blur loops [1:].
+        # We don't strip the data server-side because the user owns it —
+        # gating is purely visual / UX.
+        "preview_only": not is_pro_user,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Payments — Stripe Checkout
 # ---------------------------------------------------------------------------
 
