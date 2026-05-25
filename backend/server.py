@@ -132,6 +132,7 @@ async def app_key_gate(request: Request, call_next):
     if (
         path.startswith("/api/payments/webhook")
         or path.startswith("/api/payments/return")  # HTTPS bridge for Stripe redirect
+        or path.startswith("/api/payments/diag")    # browser-visible Stripe diagnostic
         or path.startswith("/api/diag")
         or path == "/"
     ):
