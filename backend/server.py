@@ -432,25 +432,31 @@ async def auth_google(body: GoogleRequest, request: Request, response: Response)
     picture = info.get("picture")
     ip = request.client.host if request.client else None
 
+    # Idempotent upsert keyed on email. The previous SELECT-then-INSERT
+    # pattern races: if two requests for the same Google account arrive
+    # before the first commits, both see existing=None and both attempt
+    # INSERT — the second one hits a unique-constraint violation and the
+    # endpoint 500s. ON CONFLICT lets the second request quietly update
+    # the existing row instead. The new user_id is only used if the row
+    # didn't exist already; on conflict we read back whatever id is on
+    # the row that's actually in the table.
+    new_user_id = f"user_{uuid.uuid4().hex[:16]}"
     async with pool.acquire() as conn:
-        existing = await conn.fetchrow("SELECT * FROM users WHERE email = $1", email)
-        if existing:
-            user_id = existing["user_id"]
-            await conn.execute(
-                "UPDATE users SET name = $1, picture = $2, last_active = $3 WHERE user_id = $4",
-                name, picture, now_iso(), user_id,
-            )
-        else:
-            user_id = f"user_{uuid.uuid4().hex[:16]}"
-            await conn.execute(
-                """
-                INSERT INTO users (user_id, email, name, picture, is_guest, plan_tier, created_at, ip_address, last_active, customization, unlocked_items)
-                VALUES ($1,$2,$3,$4,FALSE,'free',$5,$6,$5,$7,$8)
-                """,
-                user_id, email, name, picture, now_iso(), ip,
-                json.dumps({}), json.dumps([]),
-            )
-        u = await conn.fetchrow("SELECT * FROM users WHERE user_id = $1", user_id)
+        await conn.execute(
+            """
+            INSERT INTO users (user_id, email, name, picture, is_guest, plan_tier,
+                               created_at, ip_address, last_active, customization, unlocked_items)
+            VALUES ($1,$2,$3,$4,FALSE,'free',$5,$6,$5,$7,$8)
+            ON CONFLICT (email) DO UPDATE
+              SET name = EXCLUDED.name,
+                  picture = EXCLUDED.picture,
+                  last_active = EXCLUDED.last_active
+            """,
+            new_user_id, email, name, picture, now_iso(), ip,
+            json.dumps({}), json.dumps([]),
+        )
+        u = await conn.fetchrow("SELECT * FROM users WHERE email = $1", email)
+        user_id = u["user_id"] if u else new_user_id
 
     token = await create_session(user_id)
     attach_session_cookie(response, token)
