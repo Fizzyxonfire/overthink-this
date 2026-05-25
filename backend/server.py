@@ -1351,7 +1351,7 @@ async def text_check(body: TextCheckRequest, user: dict = Depends(get_current_us
     if len(draft) > 4000:
         raise HTTPException(400, "Draft is too long (4000 char max)")
 
-    is_pro_user = (user.get("plan_tier") or "free") in {"pro_weekly", "pro_monthly", "lifetime"}
+    is_pro_user = (user.get("plan_tier") or "free") in {"pro_weekly", "pro_monthly", "pro_yearly", "lifetime"}
     if not _TEXT_CHECK_COLUMNS_READY:
         try:
             await _ensure_text_check_columns()
@@ -2602,7 +2602,7 @@ async def insights_checkin_candidate(user: dict = Depends(get_current_user)):
     falls back to the generic "did you spiral today?" reminder.
     """
     db_required()
-    is_pro_user = (user.get("plan_tier") or "free") in {"pro_weekly", "pro_monthly", "lifetime"}
+    is_pro_user = (user.get("plan_tier") or "free") in {"pro_weekly", "pro_monthly", "pro_yearly", "lifetime"}
     if not is_pro_user:
         # Free users can still call the endpoint without breaking — they
         # just always get null so the frontend keeps using the generic
@@ -2677,7 +2677,7 @@ async def insights_score(user: dict = Depends(get_current_user)):
       }
     """
     db_required()
-    is_pro_user = (user.get("plan_tier") or "free") in {"pro_weekly", "pro_monthly", "lifetime"}
+    is_pro_user = (user.get("plan_tier") or "free") in {"pro_weekly", "pro_monthly", "pro_yearly", "lifetime"}
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             """SELECT category, tone_used, resolved, resolution_status
@@ -2794,7 +2794,7 @@ async def insights_loops(user: dict = Depends(get_current_user)):
       }
     """
     db_required()
-    is_pro_user = (user.get("plan_tier") or "free") in {"pro_weekly", "pro_monthly", "lifetime"}
+    is_pro_user = (user.get("plan_tier") or "free") in {"pro_weekly", "pro_monthly", "pro_yearly", "lifetime"}
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             """SELECT id, category, tags, situation_text, resolved,
@@ -2831,6 +2831,10 @@ async def insights_loops(user: dict = Depends(get_current_user)):
 PACKAGES = {
     "weekly":  {"id": "weekly",  "label": "Spiral Starter",      "amount": 1.99,  "currency": "usd", "tier": "pro_weekly"},
     "monthly": {"id": "monthly", "label": "Deep In My Feelings", "amount": 5.99,  "currency": "usd", "tier": "pro_monthly"},
+    # Annual plan — billed once per year, treated as Pro for the whole
+    # year. Tier "pro_yearly" so isPro() in the frontend keeps working.
+    # Apply_plan sets plan_expires_at to now+365d on activation.
+    "yearly":  {"id": "yearly",  "label": "Year of Quiet",       "amount": 39.99, "currency": "usd", "tier": "pro_yearly"},
     "lifetime":{"id": "lifetime","label": "Infinite Loop Pass",  "amount": 29.99, "currency": "usd", "tier": "lifetime"},
 }
 
@@ -3038,8 +3042,13 @@ async def _create_checkout_inner(body: CheckoutRequest, user: dict):
     success_url = f"{base_https}/api/payments/return?session_id={{CHECKOUT_SESSION_ID}}&action=success"
     cancel_url  = f"{base_https}/api/payments/return?action=cancel"
     # Weekly + monthly → recurring subscriptions. Lifetime → one-time.
-    is_subscription = pkg["id"] in {"weekly", "monthly"}
-    interval = "week" if pkg["id"] == "weekly" else "month" if pkg["id"] == "monthly" else None
+    is_subscription = pkg["id"] in {"weekly", "monthly", "yearly"}
+    interval = (
+        "week"  if pkg["id"] == "weekly"  else
+        "month" if pkg["id"] == "monthly" else
+        "year"  if pkg["id"] == "yearly"  else
+        None
+    )
     price_data: dict = {
         "currency": pkg["currency"],
         "product_data": {"name": pkg["label"]},
@@ -3197,6 +3206,8 @@ async def apply_plan(session_id: str, session: Optional[dict] = None) -> dict:
             expires = (datetime.now(timezone.utc) + timedelta(days=7)).isoformat()
         elif tier == "pro_monthly":
             expires = (datetime.now(timezone.utc) + timedelta(days=30)).isoformat()
+        elif tier == "pro_yearly":
+            expires = (datetime.now(timezone.utc) + timedelta(days=365)).isoformat()
         # Capture the Stripe customer + subscription IDs so we can later
         # open the billing portal for cancellation. session.customer is a
         # string id on most checkout sessions; subscription is set on
@@ -3358,7 +3369,7 @@ async def payment_status(session_id: str, user: dict = Depends(get_current_user)
 
     # Cross-check: if the user is already on a paid tier, consider it done
     # regardless of DB transaction row state.
-    user_is_pro = user_plan_tier in {"pro_weekly", "pro_monthly", "lifetime"}
+    user_is_pro = user_plan_tier in {"pro_weekly", "pro_monthly", "pro_yearly", "lifetime"}
 
     return {
         "session_id": session_id,
