@@ -75,6 +75,19 @@ async def lifespan(_: FastAPI):
                 await conn.execute(
                     "ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_subscription_id TEXT"
                 )
+                # Onboarding step 2: personality + spiral-frequency self-report.
+                # bio is a free-form text the user writes about themselves; the
+                # other two are short canned tags from the onboarding picker.
+                # All optional — nothing reads them as required.
+                await conn.execute(
+                    "ALTER TABLE users ADD COLUMN IF NOT EXISTS bio TEXT"
+                )
+                await conn.execute(
+                    "ALTER TABLE users ADD COLUMN IF NOT EXISTS personality TEXT"
+                )
+                await conn.execute(
+                    "ALTER TABLE users ADD COLUMN IF NOT EXISTS spiral_frequency TEXT"
+                )
         except Exception as exc:
             print(f"[lifespan] column-add migration warning: {exc}")
     yield
@@ -205,6 +218,9 @@ def user_public(u: dict) -> dict:
         "phone_verified": bool(u.get("phone_verified")),
         "customization": customization,
         "unlocked_items": unlocked,
+        "bio": u.get("bio") or None,
+        "personality": u.get("personality") or None,
+        "spiral_frequency": u.get("spiral_frequency") or None,
         "created_at": u.get("created_at"),
     }
 
@@ -322,6 +338,11 @@ class GoogleRequest(BaseModel):
 class PreferencesRequest(BaseModel):
     tone_preference: Optional[str] = None
     default_category: Optional[str] = None
+    # Onboarding step 2 — personality + self-reported spiral frequency.
+    # bio is a free-form blurb the user writes about themselves.
+    bio: Optional[str] = None
+    personality: Optional[str] = None
+    spiral_frequency: Optional[str] = None
 
 
 class CustomizeRequest(BaseModel):
@@ -487,6 +508,17 @@ async def update_preferences(body: PreferencesRequest, user: dict = Depends(get_
     if body.default_category is not None:
         sets.append(f"default_category = ${len(args)+1}")
         args.append(body.default_category)
+    # Onboarding step 2 fields — accepted via the same endpoint so the
+    # onboarding screen can write them in one PATCH after the user finishes.
+    if body.bio is not None:
+        sets.append(f"bio = ${len(args)+1}")
+        args.append(body.bio[:500] if body.bio else None)  # safety cap
+    if body.personality is not None:
+        sets.append(f"personality = ${len(args)+1}")
+        args.append(body.personality[:60] if body.personality else None)
+    if body.spiral_frequency is not None:
+        sets.append(f"spiral_frequency = ${len(args)+1}")
+        args.append(body.spiral_frequency[:30] if body.spiral_frequency else None)
     if not sets:
         return {"user": user_public(user)}
     args.append(user["user_id"])
