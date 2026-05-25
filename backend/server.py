@@ -1548,7 +1548,78 @@ async def get_spiral(spiral_id: str, user: dict = Depends(get_current_user)):
         )
     if not row:
         raise HTTPException(404, "Spiral not found")
-    return {"spiral": spiral_public(dict(row))}
+    spiral = spiral_public(dict(row))
+    # Compute pattern_context on the fly — finds past spirals in the
+    # same category with ≥ 0.34 Jaccard tag overlap (same heuristic as
+    # /api/insights/loops). Cheap enough for a single-spiral GET that
+    # we don't bother caching it. Recomputed on every read so the
+    # "last resolution" stays fresh as the user resolves more spirals.
+    spiral["pattern_context"] = await _compute_pattern_context(
+        user_id=user["user_id"],
+        current_spiral=dict(row),
+    )
+    return {"spiral": spiral}
+
+
+async def _compute_pattern_context(*, user_id: str, current_spiral: dict) -> Optional[dict]:
+    """Find past spirals that match THIS one's pattern (same category +
+    Jaccard tag overlap ≥ 0.34). Returns:
+
+        {
+          "count": int,                       # incl. this spiral
+          "last_spiral_id": str | None,       # most recent prior match
+          "last_resolution_status": str | None,
+          "last_resolution_note": str | None,
+          "last_resolution_at": str | None,
+        }
+
+    Or None when there's no meaningful pattern (count < 2). The frontend
+    only renders the banner when this returns a dict — never when None.
+    """
+    cat = current_spiral.get("category") or "other"
+    cur_tags = _tag_key(current_spiral.get("tags"))
+    cur_id = current_spiral.get("id")
+    cur_created = current_spiral.get("created_at")
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT id, tags, resolution_status, resolution_note,
+                      resolved_at, created_at
+               FROM spirals
+               WHERE user_id = $1
+                 AND status = 'complete'
+                 AND category = $2
+                 AND id <> $3
+               ORDER BY created_at DESC""",
+            user_id, cat, cur_id,
+        )
+    matches = []
+    for r in rows:
+        rd = dict(r)
+        if _jaccard(_tag_key(rd.get("tags")), cur_tags) >= 0.34 or (
+            # Empty-tag spirals only match other empty-tag spirals in
+            # the same category — same rule as the clustering pass.
+            not cur_tags and not _tag_key(rd.get("tags"))
+        ):
+            matches.append(rd)
+    count_incl = len(matches) + 1
+    if count_incl < 2:
+        return None
+    # Most recent past match (already sorted DESC). Prefer one that has
+    # a resolution so the banner copy can show "last one resolved as X".
+    last_resolved = next(
+        (m for m in matches if m.get("resolution_status")), matches[0]
+    )
+    def _to_iso(v):
+        if v is None:
+            return None
+        return v.isoformat() if hasattr(v, "isoformat") else str(v)
+    return {
+        "count": count_incl,
+        "last_spiral_id": last_resolved.get("id"),
+        "last_resolution_status": last_resolved.get("resolution_status"),
+        "last_resolution_note": last_resolved.get("resolution_note"),
+        "last_resolution_at": _to_iso(last_resolved.get("resolved_at")),
+    }
 
 
 @app.patch("/api/spirals/{spiral_id}/resolve")
