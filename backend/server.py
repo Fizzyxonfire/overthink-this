@@ -2250,6 +2250,66 @@ def _summarise_loop(cluster: list) -> dict:
     }
 
 
+@app.get("/api/insights/checkin_candidate")
+async def insights_checkin_candidate(user: dict = Depends(get_current_user)):
+    """One unresolved spiral worth checking in on — picked by the local
+    notification scheduler to personalise the daily nudge.
+
+    Heuristic: oldest unresolved spiral that's at least 24h old (long
+    enough for real life to have happened) and at most 30 days old (any
+    older and the user has probably moved on; nagging would feel weird).
+    Returns {"spiral": null} when nothing qualifies — the frontend then
+    falls back to the generic "did you spiral today?" reminder.
+    """
+    db_required()
+    is_pro_user = (user.get("plan_tier") or "free") in {"pro_weekly", "pro_monthly", "lifetime"}
+    if not is_pro_user:
+        # Free users can still call the endpoint without breaking — they
+        # just always get null so the frontend keeps using the generic
+        # reminder. Avoids a 403 round-trip on every app open.
+        return {"spiral": None, "is_pro": False}
+    now = datetime.now(timezone.utc)
+    cutoff_recent = (now - timedelta(hours=24)).isoformat()
+    cutoff_stale = (now - timedelta(days=30)).isoformat()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """SELECT id, name, situation_text, category, created_at
+               FROM spirals
+               WHERE user_id = $1
+                 AND status = 'complete'
+                 AND (resolved IS FALSE OR resolved IS NULL)
+                 AND (resolution_status IS NULL
+                      OR resolution_status NOT IN
+                         ('resolved','not_resolved','other',
+                          'plot_twist_good','plot_twist_bad'))
+                 AND created_at < $2
+                 AND created_at > $3
+               ORDER BY created_at ASC
+               LIMIT 1""",
+            user["user_id"], cutoff_recent, cutoff_stale,
+        )
+    if not row:
+        return {"spiral": None, "is_pro": True}
+    s = dict(row)
+    # Headline: prefer the user's chosen name; fall back to a short
+    # snippet of the situation text. Used verbatim in the notification.
+    raw_name = s.get("name")
+    if raw_name and raw_name.strip():
+        headline = raw_name.strip()[:48]
+    else:
+        snippet = (s.get("situation_text") or "").strip().replace("\n", " ")
+        headline = (snippet[:48] + "…") if len(snippet) > 48 else (snippet or "that thing")
+    return {
+        "spiral": {
+            "id": s["id"],
+            "name": headline,
+            "category": s["category"],
+            "created_at": s["created_at"].isoformat() if hasattr(s["created_at"], "isoformat") else s["created_at"],
+        },
+        "is_pro": True,
+    }
+
+
 @app.get("/api/insights/score")
 async def insights_score(user: dict = Depends(get_current_user)):
     """Loop Resolution Score — your personal "your brain was wrong N%
