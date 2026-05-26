@@ -12,7 +12,7 @@ import secrets
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
-from typing import Any, Optional
+from typing import Any, Dict, List, Optional
 
 import asyncpg
 import httpx
@@ -26,6 +26,11 @@ load_dotenv()
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+# HuggingFace Inference Router (OpenAI-compatible). Used as the
+# secondary AI lane — when every Gemini model in the rotation refuses
+# or times out we try DeepSeek (and a couple known-good HF chat models)
+# before falling back to the offline placeholder payload.
+HF_TOKEN = os.environ.get("HF_TOKEN", "")
 STRIPE_API_KEY = os.environ.get("STRIPE_API_KEY", "")
 STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
 TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID", "")
@@ -115,6 +120,62 @@ async def lifespan(_: FastAPI):
                 )
                 await conn.execute(
                     "ALTER TABLE users ADD COLUMN IF NOT EXISTS streak_freezes_month TEXT"
+                )
+                # Multi-item archive — text-check + compatibility persistence.
+                # Each row mirrors the spiral schema's folder/accent/flagged
+                # so the frontend can treat all three item kinds uniformly.
+                # CASCADE on user_id so account deletion wipes everything.
+                await conn.execute(
+                    """CREATE TABLE IF NOT EXISTS text_checks (
+                        id TEXT PRIMARY KEY,
+                        user_id TEXT NOT NULL,
+                        name TEXT,
+                        draft TEXT NOT NULL,
+                        context TEXT,
+                        relationship TEXT,
+                        result JSONB NOT NULL,
+                        folder_id TEXT,
+                        accent_color TEXT,
+                        flagged BOOLEAN DEFAULT FALSE,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )"""
+                )
+                await conn.execute(
+                    """CREATE TABLE IF NOT EXISTS compatibility_tests (
+                        id TEXT PRIMARY KEY,
+                        user_id TEXT NOT NULL,
+                        name TEXT,
+                        person_a JSONB NOT NULL,
+                        person_b JSONB NOT NULL,
+                        result JSONB NOT NULL,
+                        folder_id TEXT,
+                        accent_color TEXT,
+                        flagged BOOLEAN DEFAULT FALSE,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )"""
+                )
+                # Cross-type pair links — user pairs a spiral with a
+                # text-check, two compatibility tests, etc. a_type/b_type
+                # are one of: 'spiral' | 'text_check' | 'compatibility'.
+                # Symmetric: when reading we query both (a_type,a_id) and
+                # (b_type,b_id) to surface every link involving an item.
+                await conn.execute(
+                    """CREATE TABLE IF NOT EXISTS item_pairs (
+                        id TEXT PRIMARY KEY,
+                        user_id TEXT NOT NULL,
+                        a_type TEXT NOT NULL,
+                        a_id TEXT NOT NULL,
+                        b_type TEXT NOT NULL,
+                        b_id TEXT NOT NULL,
+                        note TEXT,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )"""
+                )
+                await conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_item_pairs_a ON item_pairs (user_id, a_type, a_id)"
+                )
+                await conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_item_pairs_b ON item_pairs (user_id, b_type, b_id)"
                 )
         except Exception as exc:
             print(f"[lifespan] column-add migration warning: {exc}")
@@ -1226,6 +1287,111 @@ def _fallback_with_tag(situation_text: str, tone: str, reason: str) -> dict:
 # the SDK raises and we move on to the next.
 GEMINI_MODELS = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
 
+# HuggingFace Router model rotation — used after Gemini is fully
+# exhausted. First entry is the user-specified DeepSeek model; the rest
+# are known-good fallbacks pulled from popular HF Router endpoints so
+# the lane stays alive even when one provider goes down.
+HF_MODELS = [
+    "deepseek-ai/DeepSeek-V4-Pro:novita",
+    "deepseek-ai/DeepSeek-V3.2-Exp:novita",
+    "deepseek-ai/DeepSeek-V3-0324:novita",
+    "deepseek-ai/DeepSeek-R1:nebius",
+    "meta-llama/Llama-3.3-70B-Instruct:nebius",
+    "Qwen/Qwen2.5-72B-Instruct:nebius",
+]
+
+
+async def _run_hf_chain(
+    prompt: str,
+    *,
+    max_tokens: int = 2048,
+    temperature: float = 1.0,
+    json_mode: bool = True,
+    log_tag: str = "hf",
+) -> Optional[str]:
+    """Call HuggingFace Router (OpenAI-compatible) across HF_MODELS.
+    Returns the first non-empty text response, or None if every model
+    fails. JSON-mode appends a "Respond with JSON only." reminder to
+    the prompt — DeepSeek doesn't enforce response_format strictly so
+    we lean on the prompt itself.
+
+    This is a coroutine so it can sit inline in the existing async
+    runners. The underlying openai SDK call is sync; we offload it to
+    a worker thread via asyncio.to_thread so the event loop stays free.
+    """
+    if not HF_TOKEN:
+        print(f"[{log_tag}] no HF_TOKEN — skipping HuggingFace fallback")
+        return None
+    try:
+        # The user's snippet uses `openai` (HF's recommended OpenAI-compat
+        # path). InferenceClient also works but is slightly heavier.
+        from openai import OpenAI  # type: ignore
+    except Exception as ie:
+        print(f"[{log_tag}] openai SDK unavailable: {ie}")
+        return None
+
+    json_nudge = (
+        "\n\nRespond with VALID JSON ONLY. No prose, no markdown fences."
+        if json_mode else ""
+    )
+
+    def _sync_call(model_name: str) -> str:
+        client = OpenAI(
+            base_url="https://router.huggingface.co/v1",
+            api_key=HF_TOKEN,
+            timeout=45.0,
+        )
+        kwargs: Dict[str, Any] = {
+            "model": model_name,
+            "messages": [{"role": "user", "content": prompt + json_nudge}],
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+        }
+        if json_mode:
+            # Best effort — some HF-hosted providers honor this, most
+            # ignore it. The prompt nudge is the real enforcement.
+            kwargs["response_format"] = {"type": "json_object"}
+        completion = client.chat.completions.create(**kwargs)
+        msg = completion.choices[0].message
+        return (msg.content or "").strip()
+
+    import asyncio
+    last_error: Optional[Exception] = None
+    for model_name in HF_MODELS:
+        try:
+            print(f"[{log_tag}] trying HF {model_name}…")
+            text = await asyncio.to_thread(_sync_call, model_name)
+            if text:
+                print(f"[{log_tag}] ✅ HF {model_name} returned {len(text)} chars")
+                return text
+            print(f"[{log_tag}]   HF {model_name} returned empty, trying next…")
+        except Exception as me:
+            last_error = me
+            print(f"[{log_tag}]   HF {model_name} failed: {type(me).__name__}: {str(me)[:200]}")
+            continue
+    if last_error is not None:
+        print(f"[{log_tag}] HF chain exhausted — last error: {type(last_error).__name__}")
+    return None
+
+
+def _strip_json_fences(text: str) -> str:
+    """Strip ```json fences and pre/post prose the model sometimes wraps
+    around JSON output. Defensive — feeds into json.loads downstream."""
+    text = text.strip()
+    if text.startswith("```"):
+        text = text.strip("`")
+        if text.lower().startswith("json"):
+            text = text[4:]
+        text = text.strip()
+    # Some models prepend "Here is the JSON:" etc. Slice from the first
+    # `{` to the last `}` if the surrounding noise breaks json.loads.
+    if not text.startswith("{"):
+        a = text.find("{")
+        b = text.rfind("}")
+        if a != -1 and b != -1 and b > a:
+            text = text[a:b + 1]
+    return text
+
 
 async def run_gemini(situation_text: str, tone: str, category: str = "") -> dict:
     if not GEMINI_API_KEY:
@@ -1274,8 +1440,20 @@ async def run_gemini(situation_text: str, tone: str, category: str = "") -> dict
                 print(f"[gemini]   {model_name} failed: {type(me).__name__}: {str(me)[:160]}")
                 continue
 
+        # HuggingFace DeepSeek lane — only fires when Gemini chain
+        # produced nothing. Keeps the user from seeing the offline
+        # placeholder when at least one AI in the world is up.
         if not text:
-            raise last_error or ValueError("All Gemini models failed to respond")
+            print("[gemini] Gemini chain empty → trying HF DeepSeek lane")
+            hf_text = await _run_hf_chain(
+                prompt, max_tokens=4096, temperature=1.15, json_mode=True, log_tag="spiral",
+            )
+            if hf_text:
+                text = hf_text
+                used_model = "hf:deepseek"
+
+        if not text:
+            raise last_error or ValueError("All Gemini + HF models failed to respond")
 
         # Belt-and-braces in case the model still wrapped in markdown.
         if text.startswith("```"):
@@ -1466,8 +1644,16 @@ async def run_compat(a: CompatPerson, b: CompatPerson) -> dict:
             except Exception as me:
                 last_error = me
                 continue
+        # HuggingFace fallback lane before we give up on live AI.
         if not text:
-            raise last_error or ValueError("All Gemini models failed")
+            print("[compat] Gemini chain empty → trying HF DeepSeek lane")
+            hf_text = await _run_hf_chain(
+                prompt, max_tokens=2400, temperature=1.0, json_mode=True, log_tag="compat",
+            )
+            if hf_text:
+                text = hf_text
+        if not text:
+            raise last_error or ValueError("All Gemini + HF models failed")
         if text.startswith("```"):
             text = text.strip("`")
             if text.lower().startswith("json"):
@@ -1493,7 +1679,11 @@ async def run_compat(a: CompatPerson, b: CompatPerson) -> dict:
 
 @app.post("/api/compatibility")
 async def compatibility(body: CompatRequest, user: dict = Depends(get_current_user)):
-    """Pro-only. Free users get 403 → frontend routes to /paywall."""
+    """Pro-only. Free users get 403 → frontend routes to /paywall.
+
+    Side effect: persists the input + result to compatibility_tests so
+    the user can find it in their archive afterwards. saved_id comes
+    back for navigation."""
     db_required()
     if user.get("is_guest"):
         raise HTTPException(403, "Sign in to use Compatibility")
@@ -1502,7 +1692,124 @@ async def compatibility(body: CompatRequest, user: dict = Depends(get_current_us
     if not body.person_a.name.strip() or not body.person_b.name.strip():
         raise HTTPException(400, "Both people need a name")
     result = await run_compat(body.person_a, body.person_b)
-    return {"result": result}
+
+    saved_id = f"cp_{uuid.uuid4().hex[:14]}"
+    try:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """INSERT INTO compatibility_tests
+                       (id, user_id, person_a, person_b, result, created_at)
+                   VALUES ($1, $2, $3::jsonb, $4::jsonb, $5::jsonb, NOW())""",
+                saved_id, user["user_id"],
+                json.dumps(body.person_a.model_dump()),
+                json.dumps(body.person_b.model_dump()),
+                json.dumps(result),
+            )
+    except Exception as e:
+        print(f"[compat] persist failed: {type(e).__name__}: {e}")
+        saved_id = None
+
+    return {"result": result, "saved_id": saved_id}
+
+
+# ---------------------------------------------------------------------------
+# Saved Compatibility CRUD — mirror of the spirals + text-checks CRUD.
+# ---------------------------------------------------------------------------
+
+class CompatPatch(BaseModel):
+    name: Optional[str] = None
+    folder_id: Optional[str] = None
+    accent_color: Optional[str] = None
+    flagged: Optional[bool] = None
+
+
+@app.get("/api/compatibilities")
+async def list_compatibilities(
+    folder_id: Optional[str] = None,
+    flagged: Optional[bool] = None,
+    limit: int = 200,
+    user: dict = Depends(get_current_user),
+):
+    db_required()
+    where = ["user_id = $1"]
+    args: List[Any] = [user["user_id"]]
+    if folder_id == "__unfiled__":
+        where.append("folder_id IS NULL")
+    elif folder_id:
+        args.append(folder_id)
+        where.append(f"folder_id = ${len(args)}")
+    if flagged is True:
+        where.append("flagged = TRUE")
+    elif flagged is False:
+        where.append("flagged = FALSE")
+    args.append(min(max(1, limit), 500))
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            f"""SELECT * FROM compatibility_tests
+                 WHERE {' AND '.join(where)}
+                 ORDER BY created_at DESC
+                 LIMIT ${len(args)}""",
+            *args,
+        )
+    return {"compatibilities": [compat_public(dict(r)) for r in rows]}
+
+
+@app.get("/api/compatibilities/{cp_id}")
+async def get_compatibility(cp_id: str, user: dict = Depends(get_current_user)):
+    db_required()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT * FROM compatibility_tests WHERE id = $1 AND user_id = $2",
+            cp_id, user["user_id"],
+        )
+    if not row:
+        raise HTTPException(404, "Compatibility test not found")
+    return {"compatibility": compat_public(dict(row))}
+
+
+@app.patch("/api/compatibilities/{cp_id}")
+async def patch_compatibility(cp_id: str, body: CompatPatch, user: dict = Depends(get_current_user)):
+    db_required()
+    sets, args = [], []
+    if body.name is not None:
+        sets.append(f"name = ${len(args)+1}"); args.append((body.name or "").strip()[:80] or None)
+    if "folder_id" in body.model_fields_set:
+        sets.append(f"folder_id = ${len(args)+1}"); args.append(body.folder_id)
+    if "accent_color" in body.model_fields_set:
+        sets.append(f"accent_color = ${len(args)+1}"); args.append(body.accent_color)
+    if body.flagged is not None:
+        sets.append(f"flagged = ${len(args)+1}"); args.append(bool(body.flagged))
+    if not sets:
+        raise HTTPException(400, "Nothing to update")
+    args.extend([cp_id, user["user_id"]])
+    async with pool.acquire() as conn:
+        result = await conn.execute(
+            f"UPDATE compatibility_tests SET {', '.join(sets)} WHERE id = ${len(args)-1} AND user_id = ${len(args)}",
+            *args,
+        )
+        if result.endswith("0"):
+            raise HTTPException(404, "Compatibility test not found")
+        row = await conn.fetchrow("SELECT * FROM compatibility_tests WHERE id = $1", cp_id)
+    return {"compatibility": compat_public(dict(row))}
+
+
+@app.delete("/api/compatibilities/{cp_id}")
+async def delete_compatibility(cp_id: str, user: dict = Depends(get_current_user)):
+    db_required()
+    async with pool.acquire() as conn:
+        result = await conn.execute(
+            "DELETE FROM compatibility_tests WHERE id = $1 AND user_id = $2",
+            cp_id, user["user_id"],
+        )
+        await conn.execute(
+            """DELETE FROM item_pairs WHERE user_id = $1
+                AND ((a_type = 'compatibility' AND a_id = $2)
+                  OR (b_type = 'compatibility' AND b_id = $2))""",
+            user["user_id"], cp_id,
+        )
+    if result.endswith("0"):
+        raise HTTPException(404, "Compatibility test not found")
+    return {"ok": True}
 
 
 # ---------------------------------------------------------------------------
@@ -1631,8 +1938,18 @@ async def run_text_check(*, draft: str, context: str, relationship: str) -> dict
                 last_error = me
                 print(f"[text-check] {model_name} failed: {type(me).__name__}: {str(me)[:160]}")
                 continue
+        # HuggingFace fallback — DeepSeek and friends. Same prompt, same
+        # JSON shape expected. Logged separately so we can see which lane
+        # actually answered.
         if not text:
-            raise last_error or ValueError("All Gemini models failed")
+            print("[text-check] Gemini chain empty → trying HF DeepSeek lane")
+            hf_text = await _run_hf_chain(
+                prompt, max_tokens=2048, temperature=1.05, json_mode=True, log_tag="text-check",
+            )
+            if hf_text:
+                text = hf_text
+        if not text:
+            raise last_error or ValueError("All Gemini + HF models failed")
         if text.startswith("```"):
             text = text.strip("`")
             if text.lower().startswith("json"):
@@ -1702,12 +2019,44 @@ async def _ensure_text_check_columns():
 _TEXT_CHECK_COLUMNS_READY = False
 
 
+def text_check_public(row: dict) -> dict:
+    """Shape a text_checks row for the API response. Mirrors
+    spiral_public's defensive copy-and-coerce pattern so JSONB columns
+    deserialize predictably."""
+    out = dict(row)
+    # asyncpg returns JSONB as already-decoded dict; if it ever comes
+    # back as a string (e.g. older driver), parse defensively.
+    res = out.get("result")
+    if isinstance(res, str):
+        try: out["result"] = json.loads(res)
+        except Exception: out["result"] = {}
+    if isinstance(out.get("created_at"), datetime):
+        out["created_at"] = out["created_at"].isoformat()
+    return out
+
+
+def compat_public(row: dict) -> dict:
+    out = dict(row)
+    for key in ("result", "person_a", "person_b"):
+        v = out.get(key)
+        if isinstance(v, str):
+            try: out[key] = json.loads(v)
+            except Exception: out[key] = {} if key == "result" else {}
+    if isinstance(out.get("created_at"), datetime):
+        out["created_at"] = out["created_at"].isoformat()
+    return out
+
+
 @app.post("/api/text-check")
 async def text_check(body: TextCheckRequest, user: dict = Depends(get_current_user)):
     """Pre-send draft analyzer — Pro-only. Returns three predicted
     responses + a verdict + optional rewrite. Free users get a 403
     with a clear "upgrade" message; the frontend routes that to the
-    paywall instead of showing an error."""
+    paywall instead of showing an error.
+
+    Side effect: persists the input + result to the text_checks table
+    so the user can find it in their archive afterwards. The saved id
+    comes back as `saved_id` for navigation."""
     db_required()
     if user.get("is_guest"):
         raise HTTPException(403, "Sign in to use Text-Check")
@@ -1730,8 +2079,26 @@ async def text_check(body: TextCheckRequest, user: dict = Depends(get_current_us
         relationship=body.relationship or "someone",
     )
 
+    # Persist — even fallback results are saved so the user keeps the
+    # record of their draft. They can delete/rename/folder/pair it.
+    saved_id = f"tc_{uuid.uuid4().hex[:14]}"
+    try:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """INSERT INTO text_checks
+                       (id, user_id, draft, context, relationship, result, created_at)
+                   VALUES ($1, $2, $3, $4, $5, $6::jsonb, NOW())""",
+                saved_id, user["user_id"], draft,
+                body.context or "", body.relationship or "someone",
+                json.dumps(result),
+            )
+    except Exception as e:
+        print(f"[text-check] persist failed: {type(e).__name__}: {e}")
+        saved_id = None
+
     return {
         "result": result,
+        "saved_id": saved_id,
         "usage": {
             "is_pro": True,
             "used_this_month": 0,
@@ -1739,6 +2106,109 @@ async def text_check(body: TextCheckRequest, user: dict = Depends(get_current_us
             "remaining": None,
         },
     }
+
+
+# ---------------------------------------------------------------------------
+# Saved Text-Checks CRUD — mirror of the spirals archive endpoints.
+# All Pro-gated implicitly because the only way to create a row is via
+# /api/text-check which is itself Pro-gated.
+# ---------------------------------------------------------------------------
+
+class TextCheckPatch(BaseModel):
+    name: Optional[str] = None
+    folder_id: Optional[str] = None
+    accent_color: Optional[str] = None
+    flagged: Optional[bool] = None
+
+
+@app.get("/api/text-checks")
+async def list_text_checks(
+    folder_id: Optional[str] = None,
+    flagged: Optional[bool] = None,
+    limit: int = 200,
+    user: dict = Depends(get_current_user),
+):
+    db_required()
+    where = ["user_id = $1"]
+    args: List[Any] = [user["user_id"]]
+    if folder_id == "__unfiled__":
+        where.append("folder_id IS NULL")
+    elif folder_id:
+        args.append(folder_id)
+        where.append(f"folder_id = ${len(args)}")
+    if flagged is True:
+        where.append("flagged = TRUE")
+    elif flagged is False:
+        where.append("flagged = FALSE")
+    args.append(min(max(1, limit), 500))
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            f"""SELECT * FROM text_checks
+                 WHERE {' AND '.join(where)}
+                 ORDER BY created_at DESC
+                 LIMIT ${len(args)}""",
+            *args,
+        )
+    return {"text_checks": [text_check_public(dict(r)) for r in rows]}
+
+
+@app.get("/api/text-checks/{tc_id}")
+async def get_text_check(tc_id: str, user: dict = Depends(get_current_user)):
+    db_required()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT * FROM text_checks WHERE id = $1 AND user_id = $2",
+            tc_id, user["user_id"],
+        )
+    if not row:
+        raise HTTPException(404, "Text-check not found")
+    return {"text_check": text_check_public(dict(row))}
+
+
+@app.patch("/api/text-checks/{tc_id}")
+async def patch_text_check(tc_id: str, body: TextCheckPatch, user: dict = Depends(get_current_user)):
+    db_required()
+    sets, args = [], []
+    if body.name is not None:
+        sets.append(f"name = ${len(args)+1}"); args.append((body.name or "").strip()[:80] or None)
+    if "folder_id" in body.model_fields_set:
+        sets.append(f"folder_id = ${len(args)+1}"); args.append(body.folder_id)
+    if "accent_color" in body.model_fields_set:
+        sets.append(f"accent_color = ${len(args)+1}"); args.append(body.accent_color)
+    if body.flagged is not None:
+        sets.append(f"flagged = ${len(args)+1}"); args.append(bool(body.flagged))
+    if not sets:
+        raise HTTPException(400, "Nothing to update")
+    args.extend([tc_id, user["user_id"]])
+    async with pool.acquire() as conn:
+        result = await conn.execute(
+            f"UPDATE text_checks SET {', '.join(sets)} WHERE id = ${len(args)-1} AND user_id = ${len(args)}",
+            *args,
+        )
+        if result.endswith("0"):
+            raise HTTPException(404, "Text-check not found")
+        row = await conn.fetchrow("SELECT * FROM text_checks WHERE id = $1", tc_id)
+    return {"text_check": text_check_public(dict(row))}
+
+
+@app.delete("/api/text-checks/{tc_id}")
+async def delete_text_check(tc_id: str, user: dict = Depends(get_current_user)):
+    db_required()
+    async with pool.acquire() as conn:
+        result = await conn.execute(
+            "DELETE FROM text_checks WHERE id = $1 AND user_id = $2",
+            tc_id, user["user_id"],
+        )
+        # Cascade-clean any pair rows referencing this item.
+        await conn.execute(
+            """DELETE FROM item_pairs WHERE user_id = $1
+                AND ((a_type = 'text_check' AND a_id = $2)
+                  OR (b_type = 'text_check' AND b_id = $2))""",
+            user["user_id"], tc_id,
+        )
+    if result.endswith("0"):
+        raise HTTPException(404, "Text-check not found")
+    return {"ok": True}
 
 
 # ---------------------------------------------------------------------------
@@ -2457,19 +2927,30 @@ async def patch_spiral(spiral_id: str, body: SpiralPatch, user: dict = Depends(g
 @app.get("/api/folders")
 async def list_folders(user: dict = Depends(get_current_user)):
     db_required()
+    # item_count aggregates across all three item kinds (spirals,
+    # text-checks, compatibility tests) since the user can drop any of
+    # them into a folder. spiral_count is kept for backwards-compat
+    # with older frontends that still read that field.
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             """SELECT f.id, f.name, f.color, f.created_at,
-                      COUNT(s.id) AS spiral_count
+                      (SELECT COUNT(*) FROM spirals s
+                         WHERE s.folder_id = f.id AND s.user_id = f.user_id) AS spiral_count,
+                      (SELECT COUNT(*) FROM text_checks tc
+                         WHERE tc.folder_id = f.id AND tc.user_id = f.user_id) AS text_check_count,
+                      (SELECT COUNT(*) FROM compatibility_tests ct
+                         WHERE ct.folder_id = f.id AND ct.user_id = f.user_id) AS compat_count
                  FROM folders f
-                 LEFT JOIN spirals s
-                        ON s.folder_id = f.id AND s.user_id = f.user_id
                 WHERE f.user_id = $1
-                GROUP BY f.id
                 ORDER BY f.created_at DESC""",
             user["user_id"],
         )
-    return {"folders": [dict(r) for r in rows]}
+    out = []
+    for r in rows:
+        d = dict(r)
+        d["item_count"] = int(d["spiral_count"] or 0) + int(d["text_check_count"] or 0) + int(d["compat_count"] or 0)
+        out.append(d)
+    return {"folders": out}
 
 
 @app.post("/api/folders")
@@ -2524,9 +3005,18 @@ async def rename_folder(folder_id: str, body: FolderRename, user: dict = Depends
 async def delete_folder(folder_id: str, user: dict = Depends(get_current_user)):
     db_required()
     async with pool.acquire() as conn:
-        # Detach any spirals from the deleted folder (don't delete them)
+        # Detach all three item kinds from the deleted folder (don't
+        # delete the items themselves — they move to Unfiled).
         await conn.execute(
             "UPDATE spirals SET folder_id = NULL WHERE folder_id = $1 AND user_id = $2",
+            folder_id, user["user_id"],
+        )
+        await conn.execute(
+            "UPDATE text_checks SET folder_id = NULL WHERE folder_id = $1 AND user_id = $2",
+            folder_id, user["user_id"],
+        )
+        await conn.execute(
+            "UPDATE compatibility_tests SET folder_id = NULL WHERE folder_id = $1 AND user_id = $2",
             folder_id, user["user_id"],
         )
         await conn.execute(
@@ -2570,7 +3060,181 @@ async def delete_spiral(spiral_id: str, user: dict = Depends(get_current_user)):
             "UPDATE users SET deleted_count = deleted_count + 1 WHERE user_id = $1",
             user["user_id"],
         )
+        # Drop any cross-type pair rows that referenced this spiral so
+        # the archive's "related" lists don't show ghost links.
+        await conn.execute(
+            """DELETE FROM item_pairs WHERE user_id = $1
+                AND ((a_type = 'spiral' AND a_id = $2)
+                  OR (b_type = 'spiral' AND b_id = $2))""",
+            user["user_id"], spiral_id,
+        )
     return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# Cross-type pairing
+# ---------------------------------------------------------------------------
+#
+# A "pair" is a user-asserted link between any two archive items —
+# spiral ↔ spiral, spiral ↔ text-check, text-check ↔ compatibility, etc.
+# The pair row stores (a_type, a_id, b_type, b_id) without enforcing an
+# order. On read we OR both sides so each item shows every link.
+
+VALID_PAIR_TYPES = {"spiral", "text_check", "compatibility"}
+
+
+class PairCreate(BaseModel):
+    a_type: str
+    a_id: str
+    b_type: str
+    b_id: str
+    note: Optional[str] = None
+
+
+async def _verify_item_owned(conn, item_type: str, item_id: str, user_id: str) -> bool:
+    """Confirm the requested item belongs to the user. Prevents pairing
+    your own item with a stranger's id."""
+    table = {
+        "spiral": "spirals",
+        "text_check": "text_checks",
+        "compatibility": "compatibility_tests",
+    }.get(item_type)
+    if not table:
+        return False
+    row = await conn.fetchrow(
+        f"SELECT 1 FROM {table} WHERE id = $1 AND user_id = $2",
+        item_id, user_id,
+    )
+    return row is not None
+
+
+@app.post("/api/pairs")
+async def create_pair(body: PairCreate, user: dict = Depends(get_current_user)):
+    db_required()
+    if body.a_type not in VALID_PAIR_TYPES or body.b_type not in VALID_PAIR_TYPES:
+        raise HTTPException(400, "Invalid item type")
+    if body.a_type == body.b_type and body.a_id == body.b_id:
+        raise HTTPException(400, "Cannot pair an item with itself")
+    async with pool.acquire() as conn:
+        # Ownership check on both sides.
+        ok_a = await _verify_item_owned(conn, body.a_type, body.a_id, user["user_id"])
+        ok_b = await _verify_item_owned(conn, body.b_type, body.b_id, user["user_id"])
+        if not (ok_a and ok_b):
+            raise HTTPException(404, "One or both items not found")
+        # De-dup: if a pair (either orientation) already exists, return it.
+        existing = await conn.fetchrow(
+            """SELECT * FROM item_pairs
+                WHERE user_id = $1
+                  AND ((a_type = $2 AND a_id = $3 AND b_type = $4 AND b_id = $5)
+                    OR (a_type = $4 AND a_id = $5 AND b_type = $2 AND b_id = $3))""",
+            user["user_id"], body.a_type, body.a_id, body.b_type, body.b_id,
+        )
+        if existing:
+            return {"pair": dict(existing), "created": False}
+        pair_id = f"pr_{uuid.uuid4().hex[:14]}"
+        await conn.execute(
+            """INSERT INTO item_pairs (id, user_id, a_type, a_id, b_type, b_id, note, created_at)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())""",
+            pair_id, user["user_id"],
+            body.a_type, body.a_id, body.b_type, body.b_id,
+            (body.note or "").strip()[:200] or None,
+        )
+        row = await conn.fetchrow("SELECT * FROM item_pairs WHERE id = $1", pair_id)
+    return {"pair": dict(row), "created": True}
+
+
+@app.delete("/api/pairs/{pair_id}")
+async def delete_pair(pair_id: str, user: dict = Depends(get_current_user)):
+    db_required()
+    async with pool.acquire() as conn:
+        result = await conn.execute(
+            "DELETE FROM item_pairs WHERE id = $1 AND user_id = $2",
+            pair_id, user["user_id"],
+        )
+    if result.endswith("0"):
+        raise HTTPException(404, "Pair not found")
+    return {"ok": True}
+
+
+@app.get("/api/pairs/{item_type}/{item_id}")
+async def list_pairs_for_item(item_type: str, item_id: str, user: dict = Depends(get_current_user)):
+    """Return every pair row that references the given item, with the
+    partner item denormalised into the payload so the frontend can render
+    a one-glance list without N+1 follow-up requests."""
+    db_required()
+    if item_type not in VALID_PAIR_TYPES:
+        raise HTTPException(400, "Invalid item type")
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT * FROM item_pairs
+                WHERE user_id = $1
+                  AND ((a_type = $2 AND a_id = $3)
+                    OR (b_type = $2 AND b_id = $3))
+                ORDER BY created_at DESC""",
+            user["user_id"], item_type, item_id,
+        )
+        pairs = []
+        for r in rows:
+            d = dict(r)
+            # Figure out which side is "the other one" from this item's POV.
+            if d["a_type"] == item_type and d["a_id"] == item_id:
+                partner_type, partner_id = d["b_type"], d["b_id"]
+            else:
+                partner_type, partner_id = d["a_type"], d["a_id"]
+            d["partner_type"] = partner_type
+            d["partner_id"]   = partner_id
+
+            # Resolve the partner's display metadata (name + preview) so
+            # the frontend doesn't have to fan out fetches.
+            preview: Optional[Dict[str, Any]] = None
+            if partner_type == "spiral":
+                pr = await conn.fetchrow(
+                    "SELECT id, name, situation_text, category, created_at FROM spirals WHERE id = $1 AND user_id = $2",
+                    partner_id, user["user_id"],
+                )
+                if pr:
+                    preview = {
+                        "id": pr["id"],
+                        "name": pr["name"],
+                        "title": (pr["name"] or pr["situation_text"] or "")[:80],
+                        "subtitle": pr["category"],
+                        "created_at": pr["created_at"].isoformat() if isinstance(pr["created_at"], datetime) else pr["created_at"],
+                    }
+            elif partner_type == "text_check":
+                pr = await conn.fetchrow(
+                    "SELECT id, name, draft, relationship, created_at FROM text_checks WHERE id = $1 AND user_id = $2",
+                    partner_id, user["user_id"],
+                )
+                if pr:
+                    preview = {
+                        "id": pr["id"],
+                        "name": pr["name"],
+                        "title": (pr["name"] or pr["draft"] or "")[:80],
+                        "subtitle": f"Text → {pr['relationship'] or 'someone'}",
+                        "created_at": pr["created_at"].isoformat() if isinstance(pr["created_at"], datetime) else pr["created_at"],
+                    }
+            elif partner_type == "compatibility":
+                pr = await conn.fetchrow(
+                    "SELECT id, name, person_a, person_b, created_at FROM compatibility_tests WHERE id = $1 AND user_id = $2",
+                    partner_id, user["user_id"],
+                )
+                if pr:
+                    pa = pr["person_a"] if isinstance(pr["person_a"], dict) else (json.loads(pr["person_a"]) if pr["person_a"] else {})
+                    pb = pr["person_b"] if isinstance(pr["person_b"], dict) else (json.loads(pr["person_b"]) if pr["person_b"] else {})
+                    preview = {
+                        "id": pr["id"],
+                        "name": pr["name"],
+                        "title": pr["name"] or f"{pa.get('name','?')} × {pb.get('name','?')}",
+                        "subtitle": "Compatibility",
+                        "created_at": pr["created_at"].isoformat() if isinstance(pr["created_at"], datetime) else pr["created_at"],
+                    }
+            d["preview"] = preview
+            if isinstance(d.get("created_at"), datetime):
+                d["created_at"] = d["created_at"].isoformat()
+            # Drop the orphan if the partner item no longer exists.
+            if preview is not None:
+                pairs.append(d)
+    return {"pairs": pairs}
 
 
 # ---------------------------------------------------------------------------

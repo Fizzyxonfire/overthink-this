@@ -3,6 +3,7 @@ uvicorn[standard]
 asyncpg
 python-dotenv
 google-genai
+openai
 stripe
 httpx
 pydantic
