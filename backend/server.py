@@ -710,6 +710,130 @@ async def phone_verify(body: PhoneVerifyRequest, user: dict = Depends(get_curren
 # Gemini integration
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Themed Drops (feature #7) — limited-time AI voice editions.
+#
+# Each drop is a curated time-limited tone with its own voice prompt
+# (replacing TONE_PROMPTS entries for that window). Pro-only. Frontend
+# shows the active drop as a 5th tone tile on the input screen with a
+# countdown to "ENDS IN N DAYS" — FOMO is the engine here.
+#
+# Voice prompts are deliberately short — they REPLACE the standard
+# TONE_PROMPTS string, and the structural rules in _build_prompt still
+# apply (JSON shape, anti-pattern rules, etc.). Keep the voice section
+# tight and dripping with character.
+#
+# Add new drops by appending here. start/end are inclusive of start,
+# exclusive of end (YYYY-MM-DD UTC). Overlapping windows are allowed;
+# the first match wins.
+# ---------------------------------------------------------------------------
+DROPS: list[dict] = [
+    {
+        "id": "stoic",
+        "label": "The Stoic Drop",
+        "sub": "Marcus Aurelius reads your spiral.",
+        "icon": "leaf",
+        "start": "2026-05-01",
+        "end":   "2026-06-15",
+        "voice": (
+            "You are a Roman stoic philosopher in the lineage of Marcus Aurelius "
+            "and Epictetus, transplanted to the present day. You speak in calm, "
+            "weighty sentences. You distinguish what is in the user's power from "
+            "what is not — and you do it gently. You quote no one. You write in "
+            "your own voice. You sound like someone who has buried friends and "
+            "watched empires fall; the user's worry is real to you, but you also "
+            "know its shape. You never say 'mindfulness' or 'breathe'. You speak "
+            "in metaphors of weather, harbours, soldiers, gardens. Wit is dry "
+            "and slow. The user should feel held by someone older."
+        ),
+    },
+    {
+        "id": "sunday_scaries",
+        "label": "Sunday Scaries Edition",
+        "sub": "For the dread before the week starts.",
+        "icon": "moon",
+        "start": "2026-05-01",
+        "end":   "2026-07-01",
+        "voice": (
+            "You are the voice of a Sunday night at 9pm — when the week ahead "
+            "starts pressing on the chest. You're warm but you don't pretend "
+            "the dread isn't there. You speak like the friend who's already in "
+            "their pyjamas, lights low, ready to listen but also a little "
+            "tired. You use specific references — Monday morning emails, the "
+            "alarm not yet set, the laundry still in the dryer. Half the work "
+            "is naming the feeling so the user stops fighting it. You're allowed "
+            "to be a little funny but never falsely cheerful. You sometimes end "
+            "with a single tiny doable thing — 'set out tomorrow's coffee.'"
+        ),
+    },
+    {
+        "id": "late_night",
+        "label": "The 3 AM Drop",
+        "sub": "For the spirals that wake you up.",
+        "icon": "bed",
+        "start": "2026-04-01",
+        "end":   "2026-09-30",
+        "voice": (
+            "You are speaking to someone who is awake at 3 in the morning and "
+            "shouldn't be. Your voice is low, intimate, slightly haunted. You "
+            "know the specific texture of 3 AM thoughts — how everything feels "
+            "permanent, how silence amplifies, how the brain stitches every "
+            "small thing into evidence of a larger wrong. You do not minimise "
+            "the worry. You name what 3 AM does. You're allowed to write in "
+            "fragments. Short lines. A breath. Another. You bring the user back "
+            "down to the room they're actually in. The verdict is one sentence "
+            "that makes the room a little smaller and safer."
+        ),
+    },
+]
+
+
+def _drop_by_id(drop_id: str) -> Optional[dict]:
+    return next((d for d in DROPS if d["id"] == drop_id), None)
+
+
+def _active_drop(today_iso: str) -> Optional[dict]:
+    return next((d for d in DROPS if d["start"] <= today_iso < d["end"]), None)
+
+
+def _next_drop(today_iso: str) -> Optional[dict]:
+    upcoming = [d for d in DROPS if d["start"] > today_iso]
+    upcoming.sort(key=lambda d: d["start"])
+    return upcoming[0] if upcoming else None
+
+
+def _drop_public(d: Optional[dict]) -> Optional[dict]:
+    """Strip the prompt out before sending to the client — only the
+    metadata is needed there. tone_id is the value the client passes
+    back when creating a spiral with this drop."""
+    if not d:
+        return None
+    return {
+        "id": d["id"],
+        "label": d["label"],
+        "sub": d["sub"],
+        "icon": d["icon"],
+        "starts_at": d["start"],
+        "ends_at": d["end"],
+        "tone_id": f"drop:{d['id']}",
+    }
+
+
+@app.get("/api/drops/current")
+async def drops_current(user: dict = Depends(get_current_user)):
+    """Returns the currently active themed drop (if any) + a preview of
+    the next one (if there's an upcoming drop in the catalog). Used by
+    the input screen to render the 5th tone tile + a 'coming soon' hint.
+    """
+    today = today_iso_date()
+    is_pro_user = _is_pro_tier(user.get("plan_tier"))
+    return {
+        "active": _drop_public(_active_drop(today)),
+        "next":   _drop_public(_next_drop(today)),
+        "is_pro": is_pro_user,
+    }
+
+
 TONE_PROMPTS = {
     "gentle": """You are speaking as the user's most emotionally intelligent friend — the one who sits next to them when their brain won't shut up. You're warm, present, and gentle, but you're not a wellness app. You sound like a real person. You feel things. You laugh softly at how dramatic the worry sounds even while taking the pain seriously.
 
@@ -997,8 +1121,19 @@ def _best_effort_json_cleanup(raw: str) -> str:
 
 def _build_prompt(situation_text: str, tone: str, category: str = "") -> str:
     """Assemble the full Gemini prompt by injecting the user's situation
-    into the tone-specific template."""
-    voice = TONE_PROMPTS.get(tone, TONE_PROMPTS["balanced"])
+    into the tone-specific template.
+
+    When `tone` looks like "drop:<id>" we resolve it against the DROPS
+    catalog and use that drop's voice prompt instead of TONE_PROMPTS.
+    Falls back to balanced if the drop id is unknown (defensive — the
+    drop window might have closed between submit and processing)."""
+    voice = TONE_PROMPTS["balanced"]
+    if tone.startswith("drop:"):
+        drop = _drop_by_id(tone.split(":", 1)[1])
+        if drop:
+            voice = drop["voice"]
+    else:
+        voice = TONE_PROMPTS.get(tone, TONE_PROMPTS["balanced"])
     cat_hint = f"\nCategory: {category}\n" if category else ""
     return f"""{voice}
 
@@ -1832,6 +1967,18 @@ async def create_spiral(body: SpiralCreate, user: dict = Depends(get_current_use
     # Paywall: free tier capped at lifetime total
     if (user.get("plan_tier") or "free") == "free" and (user.get("spirals_total") or 0) >= FREE_LIFETIME_LIMIT:
         raise HTTPException(402, "Free tier limit reached. Upgrade to keep going.")
+
+    # Themed drops (#7) are Pro-only. Also reject the request if the
+    # drop window has closed between when the frontend last loaded
+    # /api/drops/current and now (defensive — UI should hide it once
+    # ended, but a stale client could still try).
+    if body.tone.startswith("drop:"):
+        if not _is_pro_tier(user.get("plan_tier")):
+            raise HTTPException(403, "Themed drops are a Pro feature. Upgrade to use them.")
+        drop = _drop_by_id(body.tone.split(":", 1)[1])
+        today = today_iso_date()
+        if not drop or not (drop["start"] <= today < drop["end"]):
+            raise HTTPException(400, "That drop is no longer active.")
 
     spiral_id = f"sp_{uuid.uuid4().hex[:18]}"
     async with pool.acquire() as conn:
