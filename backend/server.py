@@ -1291,14 +1291,36 @@ GEMINI_MODELS = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
 # exhausted. First entry is the user-specified DeepSeek model; the rest
 # are known-good fallbacks pulled from popular HF Router endpoints so
 # the lane stays alive even when one provider goes down.
+#
+# Spans multiple providers (novita, nebius, hyperbolic, together, fireworks)
+# so an entire provider being down doesn't take out the lane. Each
+# entry below is a different (model, provider) combo — the more, the
+# better the survival odds during regional outages.
 HF_MODELS = [
     "deepseek-ai/DeepSeek-V4-Pro:novita",
     "deepseek-ai/DeepSeek-V3.2-Exp:novita",
     "deepseek-ai/DeepSeek-V3-0324:novita",
+    "deepseek-ai/DeepSeek-V3-0324:fireworks-ai",
+    "deepseek-ai/DeepSeek-V3-0324:together",
     "deepseek-ai/DeepSeek-R1:nebius",
+    "deepseek-ai/DeepSeek-R1:hyperbolic",
     "meta-llama/Llama-3.3-70B-Instruct:nebius",
+    "meta-llama/Llama-3.3-70B-Instruct:hyperbolic",
     "Qwen/Qwen2.5-72B-Instruct:nebius",
+    "Qwen/Qwen2.5-72B-Instruct:hyperbolic",
+    "mistralai/Mistral-Nemo-Instruct-2407:novita",
+    "Qwen/Qwen2.5-7B-Instruct:hf-inference",
 ]
+
+# Retries-per-model. Some provider failures are transient (rate
+# limits, cold-starts, brief 5xx) — a quick second shot rescues the
+# call without escalating to the next model.
+HF_RETRIES_PER_MODEL = 2
+GEMINI_RETRIES_PER_MODEL = 2
+# Whole-chain re-runs after the first pass fails. Buys time for a
+# transient outage to clear before we give up and return the
+# placeholder. Each re-run sleeps progressively longer.
+FULL_CHAIN_RETRIES = 2
 
 
 async def _run_hf_chain(
@@ -1358,20 +1380,109 @@ async def _run_hf_chain(
     import asyncio
     last_error: Optional[Exception] = None
     for model_name in HF_MODELS:
-        try:
-            print(f"[{log_tag}] trying HF {model_name}…")
-            text = await asyncio.to_thread(_sync_call, model_name)
-            if text:
-                print(f"[{log_tag}] ✅ HF {model_name} returned {len(text)} chars")
-                return text
-            print(f"[{log_tag}]   HF {model_name} returned empty, trying next…")
-        except Exception as me:
-            last_error = me
-            print(f"[{log_tag}]   HF {model_name} failed: {type(me).__name__}: {str(me)[:200]}")
-            continue
+        for attempt in range(1, HF_RETRIES_PER_MODEL + 1):
+            try:
+                print(f"[{log_tag}] trying HF {model_name} (attempt {attempt}/{HF_RETRIES_PER_MODEL})…")
+                text = await asyncio.to_thread(_sync_call, model_name)
+                if text:
+                    print(f"[{log_tag}] ✅ HF {model_name} returned {len(text)} chars")
+                    return text
+                print(f"[{log_tag}]   HF {model_name} returned empty, retrying…")
+            except Exception as me:
+                last_error = me
+                print(f"[{log_tag}]   HF {model_name} attempt {attempt} failed: {type(me).__name__}: {str(me)[:200]}")
+                # Small jitter before the per-model retry so we don't hammer
+                # a flaky provider in tight succession.
+                if attempt < HF_RETRIES_PER_MODEL:
+                    await asyncio.sleep(0.3 * attempt)
+                continue
     if last_error is not None:
         print(f"[{log_tag}] HF chain exhausted — last error: {type(last_error).__name__}")
     return None
+
+
+async def _run_gemini_chain(
+    prompt: str,
+    config: Any,
+    *,
+    log_tag: str = "gemini",
+) -> tuple[Optional[str], Optional[str], Optional[Exception]]:
+    """Run the Gemini model rotation with per-model retries. Returns
+    (text, used_model, last_error). Pulled out of the inline loop in
+    run_gemini so the same retry discipline applies to compat/text-check
+    paths and any future Gemini caller.
+    """
+    if not GEMINI_API_KEY:
+        return None, None, None
+    try:
+        from google import genai  # type: ignore
+    except Exception as ie:
+        print(f"[{log_tag}] google-genai SDK unavailable: {ie}")
+        return None, None, ie
+    client = genai.Client(api_key=GEMINI_API_KEY)
+    import asyncio
+    last_error: Optional[Exception] = None
+    for model_name in GEMINI_MODELS:
+        for attempt in range(1, GEMINI_RETRIES_PER_MODEL + 1):
+            try:
+                print(f"[{log_tag}] trying {model_name} (attempt {attempt}/{GEMINI_RETRIES_PER_MODEL})…")
+                resp = await client.aio.models.generate_content(
+                    model=model_name, contents=prompt, config=config,
+                )
+                text = (resp.text or "").strip()
+                if text:
+                    print(f"[{log_tag}] ✅ {model_name} returned {len(text)} chars")
+                    return text, model_name, None
+                print(f"[{log_tag}]   {model_name} attempt {attempt} returned empty")
+            except Exception as me:
+                last_error = me
+                print(f"[{log_tag}]   {model_name} attempt {attempt} failed: {type(me).__name__}: {str(me)[:160]}")
+                if attempt < GEMINI_RETRIES_PER_MODEL:
+                    await asyncio.sleep(0.3 * attempt)
+                continue
+    return None, None, last_error
+
+
+async def run_with_full_fallback(
+    prompt: str,
+    *,
+    gemini_config: Any,
+    hf_max_tokens: int,
+    hf_temperature: float,
+    log_tag: str,
+) -> tuple[Optional[str], Optional[str]]:
+    """Top-level AI runner — runs the entire (Gemini chain → HF chain)
+    sequence up to FULL_CHAIN_RETRIES + 1 times, with backoff between
+    full passes. Returns (text, used_model_tag) or (None, None) if
+    every attempt is exhausted.
+
+    The point: from the caller's perspective, you call this once and
+    you get the most aggressively-retried response the system can
+    produce. The "AI is offline" placeholder only kicks in when both
+    lanes have failed across every retry pass.
+    """
+    import asyncio
+    for chain_attempt in range(FULL_CHAIN_RETRIES + 1):
+        # Gemini lane first — usually fastest when it's up.
+        text, used_model, _ = await _run_gemini_chain(prompt, gemini_config, log_tag=log_tag)
+        if text:
+            return text, used_model
+        # HuggingFace lane — DeepSeek + Llama + Qwen across providers.
+        text = await _run_hf_chain(
+            prompt,
+            max_tokens=hf_max_tokens,
+            temperature=hf_temperature,
+            json_mode=True,
+            log_tag=log_tag,
+        )
+        if text:
+            return text, "hf:deepseek_or_fallback"
+        if chain_attempt < FULL_CHAIN_RETRIES:
+            wait = 1.5 * (chain_attempt + 1)
+            print(f"[{log_tag}] full chain failed pass {chain_attempt+1}/{FULL_CHAIN_RETRIES+1}, waiting {wait}s before retry…")
+            await asyncio.sleep(wait)
+    print(f"[{log_tag}] ❌ ALL AI lanes exhausted after {FULL_CHAIN_RETRIES+1} full passes")
+    return None, None
 
 
 def _strip_json_fences(text: str) -> str:
@@ -1394,15 +1505,12 @@ def _strip_json_fences(text: str) -> str:
 
 
 async def run_gemini(situation_text: str, tone: str, category: str = "") -> dict:
-    if not GEMINI_API_KEY:
-        print("[gemini] ❌ no GEMINI_API_KEY in env — using fallback")
-        return _fallback_with_tag(situation_text, tone, "no_api_key")
+    if not GEMINI_API_KEY and not HF_TOKEN:
+        print("[gemini] ❌ no GEMINI_API_KEY and no HF_TOKEN — using fallback")
+        return _fallback_with_tag(situation_text, tone, "no_api_keys")
     try:
         # NEW SDK — `pip install google-genai` (NOT the deprecated google-generativeai)
-        from google import genai
         from google.genai import types as gen_types
-
-        client = genai.Client(api_key=GEMINI_API_KEY)
 
         # High temperature + top_k=40 = more wandering, more variety in word
         # choice. Helps break the AI-detectable patterns.
@@ -1417,43 +1525,18 @@ async def run_gemini(situation_text: str, tone: str, category: str = "") -> dict
         prompt = _build_prompt(situation_text, tone, category)
         print(f"[gemini] → tone={tone} category={category} situation_chars={len(situation_text)}")
 
-        text = ""
-        used_model = None
-        last_error: Optional[Exception] = None
-        for model_name in GEMINI_MODELS:
-            try:
-                print(f"[gemini]   trying {model_name}…")
-                resp = await client.aio.models.generate_content(
-                    model=model_name,
-                    contents=prompt,
-                    config=config,
-                )
-                text = (resp.text or "").strip()
-                if text:
-                    used_model = model_name
-                    print(f"[gemini] ✅ {model_name} returned {len(text)} chars")
-                    break
-                else:
-                    print(f"[gemini]   {model_name} returned empty text, trying next…")
-            except Exception as me:
-                last_error = me
-                print(f"[gemini]   {model_name} failed: {type(me).__name__}: {str(me)[:160]}")
-                continue
-
-        # HuggingFace DeepSeek lane — only fires when Gemini chain
-        # produced nothing. Keeps the user from seeing the offline
-        # placeholder when at least one AI in the world is up.
+        # One call, exhausts every lane. If this returns None it means
+        # Gemini + every HF model + every retry have all failed —
+        # only then do we serve the placeholder.
+        text, used_model = await run_with_full_fallback(
+            prompt,
+            gemini_config=config,
+            hf_max_tokens=4096,
+            hf_temperature=1.15,
+            log_tag="spiral",
+        )
         if not text:
-            print("[gemini] Gemini chain empty → trying HF DeepSeek lane")
-            hf_text = await _run_hf_chain(
-                prompt, max_tokens=4096, temperature=1.15, json_mode=True, log_tag="spiral",
-            )
-            if hf_text:
-                text = hf_text
-                used_model = "hf:deepseek"
-
-        if not text:
-            raise last_error or ValueError("All Gemini + HF models failed to respond")
+            raise ValueError("All AI lanes failed after full fallback")
 
         # Belt-and-braces in case the model still wrapped in markdown.
         if text.startswith("```"):
@@ -1620,40 +1703,26 @@ async def run_compat(a: CompatPerson, b: CompatPerson) -> dict:
         "green_flags": [], "red_flags": [],
         "_ai_source": "fallback",
     }
-    if not GEMINI_API_KEY:
+    if not GEMINI_API_KEY and not HF_TOKEN:
         return fallback
     try:
-        from google import genai
         from google.genai import types as gen_types
-        client = genai.Client(api_key=GEMINI_API_KEY)
         config = gen_types.GenerateContentConfig(
             temperature=1.0, top_p=0.95, top_k=40,
             max_output_tokens=2400, response_mime_type="application/json",
         )
         prompt = _build_compat_prompt(a, b)
-        text = ""
-        last_error: Optional[Exception] = None
-        for model_name in GEMINI_MODELS:
-            try:
-                resp = await client.aio.models.generate_content(
-                    model=model_name, contents=prompt, config=config,
-                )
-                text = (resp.text or "").strip()
-                if text:
-                    break
-            except Exception as me:
-                last_error = me
-                continue
-        # HuggingFace fallback lane before we give up on live AI.
+        # Exhausts every AI lane (Gemini chain → HF DeepSeek chain →
+        # full-chain retries) before giving up.
+        text, _used_model = await run_with_full_fallback(
+            prompt,
+            gemini_config=config,
+            hf_max_tokens=2400,
+            hf_temperature=1.0,
+            log_tag="compat",
+        )
         if not text:
-            print("[compat] Gemini chain empty → trying HF DeepSeek lane")
-            hf_text = await _run_hf_chain(
-                prompt, max_tokens=2400, temperature=1.0, json_mode=True, log_tag="compat",
-            )
-            if hf_text:
-                text = hf_text
-        if not text:
-            raise last_error or ValueError("All Gemini + HF models failed")
+            raise ValueError("All AI lanes failed after full fallback")
         if text.startswith("```"):
             text = text.strip("`")
             if text.lower().startswith("json"):
@@ -1907,13 +1976,11 @@ async def run_text_check(*, draft: str, context: str, relationship: str) -> dict
     """Call Gemini with the pre-send prompt. Mirrors run_gemini's
     fallback discipline — model-rotation across GEMINI_MODELS, JSON
     cleanup, loud logging, and an offline-safe fallback."""
-    if not GEMINI_API_KEY:
-        print("[text-check] no GEMINI_API_KEY — using fallback")
-        return _text_check_fallback("no_api_key")
+    if not GEMINI_API_KEY and not HF_TOKEN:
+        print("[text-check] no GEMINI_API_KEY and no HF_TOKEN — using fallback")
+        return _text_check_fallback("no_api_keys")
     try:
-        from google import genai
         from google.genai import types as gen_types
-        client = genai.Client(api_key=GEMINI_API_KEY)
         config = gen_types.GenerateContentConfig(
             temperature=1.05,
             top_p=0.95,
@@ -1922,34 +1989,15 @@ async def run_text_check(*, draft: str, context: str, relationship: str) -> dict
             response_mime_type="application/json",
         )
         prompt = _build_text_check_prompt(draft=draft, context=context, relationship=relationship)
-        text = ""
-        last_error: Optional[Exception] = None
-        for model_name in GEMINI_MODELS:
-            try:
-                print(f"[text-check] trying {model_name}…")
-                resp = await client.aio.models.generate_content(
-                    model=model_name, contents=prompt, config=config,
-                )
-                text = (resp.text or "").strip()
-                if text:
-                    print(f"[text-check] ✅ {model_name} returned {len(text)} chars")
-                    break
-            except Exception as me:
-                last_error = me
-                print(f"[text-check] {model_name} failed: {type(me).__name__}: {str(me)[:160]}")
-                continue
-        # HuggingFace fallback — DeepSeek and friends. Same prompt, same
-        # JSON shape expected. Logged separately so we can see which lane
-        # actually answered.
+        text, _used_model = await run_with_full_fallback(
+            prompt,
+            gemini_config=config,
+            hf_max_tokens=2048,
+            hf_temperature=1.05,
+            log_tag="text-check",
+        )
         if not text:
-            print("[text-check] Gemini chain empty → trying HF DeepSeek lane")
-            hf_text = await _run_hf_chain(
-                prompt, max_tokens=2048, temperature=1.05, json_mode=True, log_tag="text-check",
-            )
-            if hf_text:
-                text = hf_text
-        if not text:
-            raise last_error or ValueError("All Gemini + HF models failed")
+            raise ValueError("All AI lanes failed after full fallback")
         if text.startswith("```"):
             text = text.strip("`")
             if text.lower().startswith("json"):
