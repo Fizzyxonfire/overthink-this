@@ -894,7 +894,7 @@ WHO YOU ARE:
 
 MANDATORY VOICE MARKERS (your response MUST sound different from the other tones):
 - Open at least ONE outcome with a deadpan callout: "Oh, this one's incredible." / "Wait, you actually said this out loud?" / "I want to frame this." / "Genuinely my favourite kind of spiral."
-- The verdict MUST be a punchline. It should make someone reading over their shoulder laugh out loud. Examples: "You've been workshopping a tragedy for an audience of one." / "Congratulations, you're the lead in a one-act play nobody wrote." / "Sara is brushing her teeth. You're writing her closing argument."
+- The verdict MUST be a punchline. It should make someone reading over their shoulder laugh out loud. Examples: "You've been workshopping a tragedy for an audience of one." / "Congratulations, you're the lead in a one-act play nobody wrote." / "Mira is brushing her teeth. You're writing her closing argument."
 - Reality checks are short, dry dunks. Treat them like quote-tweets. "Sir, this is a Wendy's." / "Babe, log off." / "You're not in a movie."
 - Use second person and accusations directly: "you're rehearsing" / "you're catastrophising" / "you're auditioning"
 - ALLOWED: light profanity ("damn", "what the hell", "shit"), sarcasm, callouts of the specific dramatic moves they made.
@@ -918,14 +918,14 @@ VOICE RULES:
 # Notice: every description is 4–6 sentences, names are used, the voice is a friend's not an analyst's.
 FEW_SHOT_EXAMPLE = """EXAMPLE INPUT
 tone: balanced
-situation: "I sent a long message to Sara at 1am about how I feel and she hasn't replied in 6 hours. I'm sure she's losing interest and I shouldn't have said anything. I'm about to send a follow-up apologizing."
+situation: "I sent a long message to Mira at 1am about how I feel and she hasn't replied in 6 hours. I'm sure she's losing interest and I shouldn't have said anything. I'm about to send a follow-up apologizing."
 
 EXAMPLE OUTPUT:
 {
   "outcomes": [
     {
-      "title": "Sara is asleep, then busy",
-      "description": "It is currently 6 hours since you sent a long emotional message at 1am. The simplest read here is that Sara slept through it, woke up, had her morning, and hasn't gotten back to her phone yet. People don't sit on the couch refreshing their inbox waiting to engineer the perfect emotional response — they live their day. The most boring explanation is also the one that doesn't require you to be a problem. You'll probably hear back this afternoon and it'll be normal.",
+      "title": "Mira is asleep, then busy",
+      "description": "It is currently 6 hours since you sent a long emotional message at 1am. The simplest read here is that Mira slept through it, woke up, had her morning, and hasn't gotten back to her phone yet. People don't sit on the couch refreshing their inbox waiting to engineer the perfect emotional response — they live their day. The most boring explanation is also the one that doesn't require you to be a problem. You'll probably hear back this afternoon and it'll be normal.",
       "probability": 55,
       "severity": "likely",
       "reality_check": "Reply windows track sleep schedules and lunch breaks. They have almost nothing to do with how someone feels about you."
@@ -952,7 +952,7 @@ EXAMPLE OUTPUT:
     "Whether you tell yourself the story of 'I ruined it' as if it's already true"
   ],
   "out_of_control": [
-    "When Sara picks up her phone",
+    "When Mira picks up her phone",
     "Whether she's a fast replier by nature or a slow one",
     "How she reads the tone of what you wrote",
     "Whether 1am her time was a fine moment or an awkward one"
@@ -963,7 +963,7 @@ EXAMPLE OUTPUT:
     "Write down, in one sentence, the thing you actually want her to say back. Then close the app and go outside for ten minutes."
   ],
   "verdict": {
-    "verdict_text": "Sara is having a Tuesday. You're having a trial."
+    "verdict_text": "Mira is having a Tuesday. You're having a trial."
   }
 }
 """
@@ -1158,7 +1158,7 @@ TONE-MATCH ENFORCEMENT (critical — your output must FEEL like the tone you wer
 
 OUTPUT FORMAT — JSON ONLY, NO MARKDOWN:
 {{
-  "name": "1-2 words. A short label for this spiral, like a chapter title. Capitalised. Example: 'Sara Silence', 'Boss Meeting', 'Late Text', 'The Apartment'.",
+  "name": "1-2 words. A short label for this spiral, like a chapter title. Capitalised. Example: 'Mira Silence', 'Boss Meeting', 'Late Text', 'The Apartment'.",
   "outcomes": [
     {{
       "title": "Short headline (3-6 words). Specific to THIS situation.",
@@ -1179,10 +1179,10 @@ OUTPUT FORMAT — JSON ONLY, NO MARKDOWN:
     "Exactly 3 concrete actions. Specific verbs. No 'try to' or 'maybe consider'."
   ],
   "verdict": {{
-    "verdict_text": "A MOTTO. Maximum 12 words. Tattoo-worthy. Hits like a punchline. Examples: 'You're auditioning for a role nobody's casting.' / 'Sara is having a Tuesday. You're having a trial.'"
+    "verdict_text": "A MOTTO. Maximum 12 words. Tattoo-worthy. Hits like a punchline. Examples: 'You're auditioning for a role nobody's casting.' / 'Mira is having a Tuesday. You're having a trial.'"
   }},
   "soundtrack": {{
-    "title": "An invented 'song title' for THIS spiral. 3–6 words. Album-art energy. Examples: 'Late-Night Sara Edition', 'Boss Meeting Blues', 'The Group Chat Cold Open', 'I Did Not Need To Send That'.",
+    "title": "An invented 'song title' for THIS spiral. 3–6 words. Album-art energy. Examples: 'Late-Night Mira Edition', 'Boss Meeting Blues', 'The Group Chat Cold Open', 'I Did Not Need To Send That'.",
     "line_1": "First line of the 'anthem'. 6–10 words. Reads like a song lyric — rhythmic, vivid, mildly funny. Anchored in the spiral's specifics (names, numbers, the actual situation). NO clichés.",
     "line_2": "Second line. Builds on or undercuts line 1. 6–10 words. Either rhymes with line 1 or hits a different rhythm. Lands like the chorus."
   }}
@@ -1339,6 +1339,170 @@ async def run_gemini(situation_text: str, tone: str, category: str = "") -> dict
         print(f"[gemini] ❌ FALLBACK — {type(exc).__name__}: {exc}")
         traceback.print_exc()
         return _fallback_with_tag(situation_text, tone, f"{type(exc).__name__}: {str(exc)[:120]}")
+
+
+# ---------------------------------------------------------------------------
+# Compatibility test — analyses two people across multiple
+# relationship axes (friends, lovers, FWB, dating, marriage,
+# roommates, work partners). Pro-only.
+#
+# Distinct prompt template from spirals + text-check. The AI is asked
+# to commit to scores and verdicts per axis, not hedge. JSON-only.
+# ---------------------------------------------------------------------------
+
+class CompatPerson(BaseModel):
+    name: str
+    gender: Optional[str] = None  # "male" | "female" | "other" | None
+    description: Optional[str] = ""
+    hobbies: Optional[str] = ""
+    status: Optional[str] = ""  # relationship status as free text
+
+
+class CompatRequest(BaseModel):
+    person_a: CompatPerson
+    person_b: CompatPerson
+
+
+def _build_compat_prompt(a: CompatPerson, b: CompatPerson) -> str:
+    """Compose the Gemini prompt for a compatibility analysis between
+    two people. Asks for SCORES + verdicts per axis with NO hedging."""
+    def _block(label: str, p: CompatPerson) -> str:
+        bits = [f"Name: {p.name.strip()}"]
+        if p.gender: bits.append(f"Gender: {p.gender}")
+        if p.status and p.status.strip(): bits.append(f"Current relationship status: {p.status.strip()}")
+        if p.description and p.description.strip(): bits.append(f"Description: {p.description.strip()}")
+        if p.hobbies and p.hobbies.strip(): bits.append(f"Hobbies / interests: {p.hobbies.strip()}")
+        return f"PERSON {label}:\n" + "\n".join(bits)
+
+    return f"""You are a sharp, honest, slightly funny observer of human dynamics. Your job: read two people's profiles and rate how compatible they'd be across SEVEN relationship axes. You commit to scores and verdicts — you do not hedge.
+
+ANTI-PATTERN RULES — read carefully:
+- DO NOT say "depends on the chemistry" or "every relationship is unique" or other platitudes.
+- DO NOT refuse to score any axis. Pick a number from 0-100 even when uncertain.
+- DO NOT moralise about FWB / casual / non-traditional setups. Treat all axes equally.
+- DO NOT mention or speculate about race, religion, ethnicity, or sexual orientation unless the profiles literally do.
+
+{_block("A", a)}
+
+{_block("B", b)}
+
+YOUR JOB:
+For each of the 7 axes below, return:
+  - score (0-100): how WELL these two would do in this specific kind of relationship.
+  - verdict (4-8 words): a single committed take.
+  - reasoning (1-2 sentences): why. Reference specifics from the profiles when possible.
+
+AXES (return in this exact order):
+  1. friends                — platonic friendship
+  2. lovers                 — emotional + romantic + sexual partnership
+  3. friends_with_benefits  — casual physical with friend energy
+  4. dating                 — early-stage romantic, no commitment yet
+  5. marriage               — long-haul committed partnership
+  6. roommates              — sharing a home, not romantic
+  7. work_partners          — co-founding / collaborating professionally
+
+ALSO RETURN:
+  - overall_chemistry (0-100): single summary score
+  - headline (one sentence, 10-14 words): the punchline of the whole reading
+  - green_flags: 2-3 bullets — what specifically WORKS between them
+  - red_flags: 2-3 bullets — what specifically DOESN'T
+
+OUTPUT FORMAT — JSON ONLY, NO MARKDOWN:
+{{
+  "overall_chemistry": <int 0-100>,
+  "headline": "<one sentence, 10-14 words>",
+  "axes": [
+    {{ "axis": "friends",                "score": <int>, "verdict": "...", "reasoning": "..." }},
+    {{ "axis": "lovers",                 "score": <int>, "verdict": "...", "reasoning": "..." }},
+    {{ "axis": "friends_with_benefits",  "score": <int>, "verdict": "...", "reasoning": "..." }},
+    {{ "axis": "dating",                 "score": <int>, "verdict": "...", "reasoning": "..." }},
+    {{ "axis": "marriage",               "score": <int>, "verdict": "...", "reasoning": "..." }},
+    {{ "axis": "roommates",              "score": <int>, "verdict": "...", "reasoning": "..." }},
+    {{ "axis": "work_partners",          "score": <int>, "verdict": "...", "reasoning": "..." }}
+  ],
+  "green_flags": ["...", "..."],
+  "red_flags":   ["...", "..."]
+}}
+
+Respond with JSON only.
+"""
+
+
+async def run_compat(a: CompatPerson, b: CompatPerson) -> dict:
+    """Call Gemini for the compatibility analysis. Mirrors run_gemini's
+    discipline — rotation across GEMINI_MODELS, JSON salvage, structured
+    fallback when offline."""
+    fallback = {
+        "overall_chemistry": 50,
+        "headline": "AI is offline — read this as a placeholder, not a verdict.",
+        "axes": [
+            {"axis": ax, "score": 50, "verdict": "Inconclusive — AI offline.", "reasoning": "Couldn't analyse right now."}
+            for ax in ["friends", "lovers", "friends_with_benefits", "dating", "marriage", "roommates", "work_partners"]
+        ],
+        "green_flags": [], "red_flags": [],
+        "_ai_source": "fallback",
+    }
+    if not GEMINI_API_KEY:
+        return fallback
+    try:
+        from google import genai
+        from google.genai import types as gen_types
+        client = genai.Client(api_key=GEMINI_API_KEY)
+        config = gen_types.GenerateContentConfig(
+            temperature=1.0, top_p=0.95, top_k=40,
+            max_output_tokens=2400, response_mime_type="application/json",
+        )
+        prompt = _build_compat_prompt(a, b)
+        text = ""
+        last_error: Optional[Exception] = None
+        for model_name in GEMINI_MODELS:
+            try:
+                resp = await client.aio.models.generate_content(
+                    model=model_name, contents=prompt, config=config,
+                )
+                text = (resp.text or "").strip()
+                if text:
+                    break
+            except Exception as me:
+                last_error = me
+                continue
+        if not text:
+            raise last_error or ValueError("All Gemini models failed")
+        if text.startswith("```"):
+            text = text.strip("`")
+            if text.lower().startswith("json"):
+                text = text[4:]
+        try:
+            data = json.loads(text)
+        except Exception:
+            data = json.loads(_best_effort_json_cleanup(text))
+        # Sanity / clamping
+        data["overall_chemistry"] = max(0, min(100, int(data.get("overall_chemistry", 50))))
+        axes = data.get("axes") or []
+        for ax in axes:
+            ax["score"] = max(0, min(100, int(ax.get("score", 50))))
+        data["axes"] = axes
+        data.setdefault("green_flags", [])
+        data.setdefault("red_flags", [])
+        data["_ai_source"] = "live"
+        return data
+    except Exception as exc:
+        print(f"[compat] FALLBACK — {type(exc).__name__}: {exc}")
+        return {**fallback, "_ai_source": f"fallback: {type(exc).__name__}"}
+
+
+@app.post("/api/compatibility")
+async def compatibility(body: CompatRequest, user: dict = Depends(get_current_user)):
+    """Pro-only. Free users get 403 → frontend routes to /paywall."""
+    db_required()
+    if user.get("is_guest"):
+        raise HTTPException(403, "Sign in to use Compatibility")
+    if not _is_pro_tier(user.get("plan_tier")):
+        raise HTTPException(403, "Compatibility is a Pro feature. Upgrade for unlimited reads.")
+    if not body.person_a.name.strip() or not body.person_b.name.strip():
+        raise HTTPException(400, "Both people need a name")
+    result = await run_compat(body.person_a, body.person_b)
+    return {"result": result}
 
 
 # ---------------------------------------------------------------------------
@@ -2778,7 +2942,7 @@ async def wrapped_current(user: dict = Depends(get_current_user)):
 #
 # Pattern detection across the user's archive. This is the differentiator
 # vs. a generic chatbot: ChatGPT forgets you between sessions; this
-# endpoint surfaces "you've spiralled about Sara 7 times this month — 6
+# endpoint surfaces "you've spiralled about Mira 7 times this month — 6
 # of those resolved as nothing happened."
 #
 # Clustering algorithm (deliberately simple v1):
