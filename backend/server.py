@@ -102,6 +102,20 @@ async def lifespan(_: FastAPI):
                 await conn.execute(
                     "ALTER TABLE spirals ADD COLUMN IF NOT EXISTS soundtrack JSONB"
                 )
+                # Feature #9 — Streak with stakes + Pro freezes.
+                # last_spiral_date isolates "the date you last logged a
+                # spiral" from the broader last_active timestamp (which
+                # also moves on Google sign-in). streak_freezes_*
+                # columns track the monthly Pro allotment.
+                await conn.execute(
+                    "ALTER TABLE users ADD COLUMN IF NOT EXISTS last_spiral_date TEXT"
+                )
+                await conn.execute(
+                    "ALTER TABLE users ADD COLUMN IF NOT EXISTS streak_freezes_remaining INTEGER DEFAULT 3"
+                )
+                await conn.execute(
+                    "ALTER TABLE users ADD COLUMN IF NOT EXISTS streak_freezes_month TEXT"
+                )
         except Exception as exc:
             print(f"[lifespan] column-add migration warning: {exc}")
     yield
@@ -214,6 +228,21 @@ def user_public(u: dict) -> dict:
             unlocked = json.loads(unlocked)
         except Exception:
             unlocked = []
+    # Streak view computed at read time — so a user who hasn't opened
+    # the app for a week sees the broken streak immediately on next
+    # login, without waiting for a background job. streak_count is
+    # OVERRIDDEN with the effective (possibly zero) value so legacy
+    # UI keeps rendering the right number.
+    streak_view = _compute_streak_view(u) if "_compute_streak_view" in globals() else {
+        "streak_count": u.get("streak_count") or 0,
+        "freezes_remaining": 3,
+        "freezes_max": 3,
+        "is_pro": False,
+        "days_since_last_spiral": None,
+        "in_danger": False,
+        "broken_today": False,
+        "last_spiral_date": None,
+    }
     return {
         "user_id": u["user_id"],
         "email": u.get("email"),
@@ -225,7 +254,9 @@ def user_public(u: dict) -> dict:
         "plan_tier": u.get("plan_tier") or "free",
         "spirals_used_today": u.get("spirals_used_today") or 0,
         "spirals_total": u.get("spirals_total") or 0,
-        "streak_count": u.get("streak_count") or 0,
+        # Effective streak — zero when the gap exceeds the freeze
+        # rescue window. Raw column value would be misleading here.
+        "streak_count": streak_view["streak_count"],
         "xp": u.get("xp") or 0,
         "level": u.get("level") or 1,
         "phone_number": u.get("phone_number"),
@@ -238,6 +269,13 @@ def user_public(u: dict) -> dict:
         # Drives the "FIRST-TIME OFFER" strikethrough on the paywall —
         # any returning subscriber sees the real price with no discount.
         "has_ever_subscribed": bool(u.get("has_ever_subscribed")),
+        # Streak-with-stakes (#9). Frontend reads these to render the
+        # flame state, "in danger" badge, and freezes counter.
+        "streak_freezes_remaining": streak_view["freezes_remaining"],
+        "streak_freezes_max": streak_view["freezes_max"],
+        "streak_in_danger": streak_view["in_danger"],
+        "streak_broken_today": streak_view["broken_today"],
+        "days_since_last_spiral": streak_view["days_since_last_spiral"],
         "created_at": u.get("created_at"),
     }
 
@@ -1614,29 +1652,76 @@ async def progress_for_event(user: dict, event: dict) -> None:
 # Streak handling
 # ---------------------------------------------------------------------------
 
-async def bump_streak_and_total(user: dict) -> dict:
-    today = today_iso_date()
-    last = user.get("last_active")
-    last_date = None
+def _date_diff_days(a_iso: Optional[str], b_iso: Optional[str]) -> Optional[int]:
+    """Return |a - b| in days when both are YYYY-MM-DD strings, else None."""
+    if not a_iso or not b_iso:
+        return None
     try:
-        if last:
-            last_date = datetime.fromisoformat(last.replace("Z", "+00:00")).date().isoformat()
+        a = datetime.fromisoformat(a_iso).date() if "T" not in a_iso else datetime.fromisoformat(a_iso.replace("Z", "+00:00")).date()
+        b = datetime.fromisoformat(b_iso).date() if "T" not in b_iso else datetime.fromisoformat(b_iso.replace("Z", "+00:00")).date()
+        return abs((a - b).days)
     except Exception:
-        last_date = None
+        return None
 
+
+def _streak_freeze_state(user: dict) -> tuple[int, str]:
+    """Resolve the user's current per-month freeze allotment, regenerating
+    if the calendar month rolled over since the last write. Returns
+    (remaining, month). Does not persist — callers are expected to write
+    them back through whatever UPDATE they're already issuing."""
+    this_month = datetime.now(timezone.utc).strftime("%Y-%m")
+    stored_month = user.get("streak_freezes_month")
+    if stored_month != this_month:
+        # New month → reset to full allotment (3). Free users never get
+        # to USE these but the column existing for everyone keeps the
+        # schema simple; the burn logic is what gates Pro-only access.
+        return (3, this_month)
+    remaining = user.get("streak_freezes_remaining")
+    if remaining is None:
+        remaining = 3
+    return (max(0, int(remaining)), this_month)
+
+
+def _is_pro_tier(plan_tier: Optional[str]) -> bool:
+    return (plan_tier or "free") in {"pro_weekly", "pro_monthly", "pro_yearly", "lifetime"}
+
+
+async def bump_streak_and_total(user: dict) -> dict:
+    """Called on every successful spiral creation. Bumps the day counter,
+    advances the streak if it's consecutive, and burns Pro freezes to
+    bridge 1–3 day gaps when possible.
+
+    Rules:
+      • diff == 0 → already spiralled today, no streak change.
+      • diff == 1 → consecutive day, streak += 1.
+      • 2 <= diff <= 4 AND Pro AND enough freezes → burn (diff - 1)
+        freezes to bridge the gap, streak += 1.
+      • Otherwise → streak resets to 1.
+
+    diff is measured against last_spiral_date (not last_active — the
+    latter also moves on Google sign-in, which would forgive missed
+    days for free.)
+    """
+    today = today_iso_date()
+    last_spiral = user.get("last_spiral_date")
     streak = user.get("streak_count") or 0
-    if last_date == today:
+    diff = _date_diff_days(last_spiral, today)
+
+    freezes_remaining, freeze_month = _streak_freeze_state(user)
+    pro = _is_pro_tier(user.get("plan_tier"))
+    freezes_burned = 0
+
+    if diff == 0:
         new_streak = streak or 1
+    elif diff == 1:
+        new_streak = streak + 1
+    elif diff is not None and 2 <= diff <= 4 and pro and freezes_remaining >= (diff - 1):
+        # Bridge the gap with freezes — one freeze per missed day.
+        freezes_burned = diff - 1
+        freezes_remaining -= freezes_burned
+        new_streak = streak + 1
     else:
-        # Was last_date == yesterday?
-        try:
-            yesterday = (datetime.now(timezone.utc).date() - timedelta(days=1)).isoformat()
-        except Exception:
-            yesterday = None
-        if last_date == yesterday:
-            new_streak = streak + 1
-        else:
-            new_streak = 1
+        new_streak = 1
 
     used_today_date = user.get("spirals_used_date")
     if used_today_date == today:
@@ -1649,13 +1734,76 @@ async def bump_streak_and_total(user: dict) -> dict:
             """UPDATE users SET
                 streak_count = $1,
                 last_active = $2,
-                spirals_used_today = $3,
-                spirals_used_date = $4,
-                spirals_total = spirals_total + 1
-               WHERE user_id = $5""",
-            new_streak, now_iso(), used_today, today, user["user_id"],
+                last_spiral_date = $3,
+                spirals_used_today = $4,
+                spirals_used_date = $5,
+                spirals_total = spirals_total + 1,
+                streak_freezes_remaining = $6,
+                streak_freezes_month = $7
+               WHERE user_id = $8""",
+            new_streak, now_iso(), today, used_today, today,
+            freezes_remaining, freeze_month, user["user_id"],
         )
+        if freezes_burned > 0:
+            print(f"[streak] burned {freezes_burned} freeze(s) for user {user['user_id']} (gap {diff} days)")
         return dict(await conn.fetchrow("SELECT * FROM users WHERE user_id = $1", user["user_id"]))
+
+
+def _compute_streak_view(user: dict) -> dict:
+    """Read-side streak state. Recomputes on every /api/auth/me so a
+    user who hasn't opened the app for days sees the correct "broken"
+    state without us needing a background job.
+
+    Returns a small dict the frontend can render directly:
+      {
+        "streak_count": int,           # zero if effectively broken
+        "freezes_remaining": int,      # always present, gated by is_pro at UI level
+        "freezes_max": 3,
+        "is_pro": bool,
+        "days_since_last_spiral": int | None,
+        "in_danger": bool,             # 1-2 days since last spiral, not broken yet
+        "broken_today": bool,          # streak just lost today (>4 days gap or out of freezes)
+        "last_spiral_date": str | None,
+      }
+    """
+    today = today_iso_date()
+    last_spiral = user.get("last_spiral_date")
+    diff = _date_diff_days(last_spiral, today)
+    streak = user.get("streak_count") or 0
+    pro = _is_pro_tier(user.get("plan_tier"))
+    freezes_remaining, _ = _streak_freeze_state(user)
+
+    in_danger = False
+    broken_today = False
+    effective_streak = streak
+
+    if diff is not None and streak > 0:
+        # diff == 0 → spiralled today, streak fresh.
+        # diff == 1 → in danger (will reset to 1 unless they spiral today).
+        # diff >= 2 → in danger; if they have freezes they're safe.
+        # diff > 4 → broken even with freezes.
+        if diff == 1:
+            in_danger = True
+        elif 2 <= diff <= 4:
+            if pro and freezes_remaining >= (diff - 1):
+                in_danger = True  # safe but on the edge
+            else:
+                broken_today = True
+                effective_streak = 0
+        elif diff > 4:
+            broken_today = True
+            effective_streak = 0
+
+    return {
+        "streak_count": effective_streak,
+        "freezes_remaining": freezes_remaining,
+        "freezes_max": 3,
+        "is_pro": pro,
+        "days_since_last_spiral": diff,
+        "in_danger": in_danger,
+        "broken_today": broken_today,
+        "last_spiral_date": last_spiral,
+    }
 
 
 async def grant_xp(user_id: str, amount: int) -> dict:
