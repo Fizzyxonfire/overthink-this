@@ -69,116 +69,84 @@ async def lifespan(_: FastAPI):
             statement_cache_size=0,  # pooler-friendly
             ssl="require" if needs_ssl else None,
         )
-        # Idempotent column adds for fields added after the initial schema.
-        # Safe to re-run on every boot — IF NOT EXISTS makes it a no-op once
-        # the column is in place. Avoids needing a manual migration step.
+        # Idempotent migrations. EACH statement runs in its own try so
+        # one failure doesn't cascade and skip the rest of the block —
+        # that bug previously meant text_checks/compatibility_tests
+        # never got created when an earlier ALTER hit anything funny.
+        migrations: List[tuple[str, str]] = [
+            ("users.stripe_customer_id",        "ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_customer_id TEXT"),
+            ("users.stripe_subscription_id",    "ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_subscription_id TEXT"),
+            # Onboarding step 2 — bio + personality + frequency self-report.
+            ("users.bio",                       "ALTER TABLE users ADD COLUMN IF NOT EXISTS bio TEXT"),
+            ("users.personality",               "ALTER TABLE users ADD COLUMN IF NOT EXISTS personality TEXT"),
+            ("users.spiral_frequency",          "ALTER TABLE users ADD COLUMN IF NOT EXISTS spiral_frequency TEXT"),
+            # First-time pricing gate.
+            ("users.has_ever_subscribed",       "ALTER TABLE users ADD COLUMN IF NOT EXISTS has_ever_subscribed BOOLEAN DEFAULT FALSE"),
+            # Feature #10 — Spiral Soundtrack JSONB sidecar.
+            ("spirals.soundtrack",              "ALTER TABLE spirals ADD COLUMN IF NOT EXISTS soundtrack JSONB"),
+            # Feature #9 — Streak with stakes + Pro freezes.
+            ("users.last_spiral_date",          "ALTER TABLE users ADD COLUMN IF NOT EXISTS last_spiral_date TEXT"),
+            ("users.streak_freezes_remaining",  "ALTER TABLE users ADD COLUMN IF NOT EXISTS streak_freezes_remaining INTEGER DEFAULT 3"),
+            ("users.streak_freezes_month",      "ALTER TABLE users ADD COLUMN IF NOT EXISTS streak_freezes_month TEXT"),
+            # Multi-item archive — text-check + compatibility persistence.
+            # Each row mirrors spiral's folder/accent/flagged so the
+            # frontend can treat all three item kinds uniformly.
+            ("text_checks",
+                """CREATE TABLE IF NOT EXISTS text_checks (
+                    id TEXT PRIMARY KEY,
+                    user_id TEXT NOT NULL,
+                    name TEXT,
+                    draft TEXT NOT NULL,
+                    context TEXT,
+                    relationship TEXT,
+                    result JSONB NOT NULL,
+                    folder_id TEXT,
+                    accent_color TEXT,
+                    flagged BOOLEAN DEFAULT FALSE,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )"""),
+            ("compatibility_tests",
+                """CREATE TABLE IF NOT EXISTS compatibility_tests (
+                    id TEXT PRIMARY KEY,
+                    user_id TEXT NOT NULL,
+                    name TEXT,
+                    person_a JSONB NOT NULL,
+                    person_b JSONB NOT NULL,
+                    result JSONB NOT NULL,
+                    folder_id TEXT,
+                    accent_color TEXT,
+                    flagged BOOLEAN DEFAULT FALSE,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )"""),
+            # Cross-type pair links.
+            ("item_pairs",
+                """CREATE TABLE IF NOT EXISTS item_pairs (
+                    id TEXT PRIMARY KEY,
+                    user_id TEXT NOT NULL,
+                    a_type TEXT NOT NULL,
+                    a_id TEXT NOT NULL,
+                    b_type TEXT NOT NULL,
+                    b_id TEXT NOT NULL,
+                    note TEXT,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )"""),
+            ("idx_item_pairs_a",
+                "CREATE INDEX IF NOT EXISTS idx_item_pairs_a ON item_pairs (user_id, a_type, a_id)"),
+            ("idx_item_pairs_b",
+                "CREATE INDEX IF NOT EXISTS idx_item_pairs_b ON item_pairs (user_id, b_type, b_id)"),
+        ]
         try:
             async with pool.acquire() as conn:
-                await conn.execute(
-                    "ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_customer_id TEXT"
-                )
-                await conn.execute(
-                    "ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_subscription_id TEXT"
-                )
-                # Onboarding step 2: personality + spiral-frequency self-report.
-                # bio is a free-form text the user writes about themselves; the
-                # other two are short canned tags from the onboarding picker.
-                # All optional — nothing reads them as required.
-                await conn.execute(
-                    "ALTER TABLE users ADD COLUMN IF NOT EXISTS bio TEXT"
-                )
-                await conn.execute(
-                    "ALTER TABLE users ADD COLUMN IF NOT EXISTS personality TEXT"
-                )
-                await conn.execute(
-                    "ALTER TABLE users ADD COLUMN IF NOT EXISTS spiral_frequency TEXT"
-                )
-                # First-time pricing — once any Pro tier ever applies
-                # for this user, the paywall stops showing the
-                # "FIRST-TIME OFFER" strikethrough. Backend prices
-                # don't change; this is purely a UX gate.
-                await conn.execute(
-                    "ALTER TABLE users ADD COLUMN IF NOT EXISTS has_ever_subscribed BOOLEAN DEFAULT FALSE"
-                )
-                # Feature #10 — Spiral Soundtrack. A 2-line anthem
-                # generated alongside each spiral. Stored as JSONB so
-                # we can add fields later (vibe tag, hashtags) without
-                # another migration. Pro-only at display time.
-                await conn.execute(
-                    "ALTER TABLE spirals ADD COLUMN IF NOT EXISTS soundtrack JSONB"
-                )
-                # Feature #9 — Streak with stakes + Pro freezes.
-                # last_spiral_date isolates "the date you last logged a
-                # spiral" from the broader last_active timestamp (which
-                # also moves on Google sign-in). streak_freezes_*
-                # columns track the monthly Pro allotment.
-                await conn.execute(
-                    "ALTER TABLE users ADD COLUMN IF NOT EXISTS last_spiral_date TEXT"
-                )
-                await conn.execute(
-                    "ALTER TABLE users ADD COLUMN IF NOT EXISTS streak_freezes_remaining INTEGER DEFAULT 3"
-                )
-                await conn.execute(
-                    "ALTER TABLE users ADD COLUMN IF NOT EXISTS streak_freezes_month TEXT"
-                )
-                # Multi-item archive — text-check + compatibility persistence.
-                # Each row mirrors the spiral schema's folder/accent/flagged
-                # so the frontend can treat all three item kinds uniformly.
-                # CASCADE on user_id so account deletion wipes everything.
-                await conn.execute(
-                    """CREATE TABLE IF NOT EXISTS text_checks (
-                        id TEXT PRIMARY KEY,
-                        user_id TEXT NOT NULL,
-                        name TEXT,
-                        draft TEXT NOT NULL,
-                        context TEXT,
-                        relationship TEXT,
-                        result JSONB NOT NULL,
-                        folder_id TEXT,
-                        accent_color TEXT,
-                        flagged BOOLEAN DEFAULT FALSE,
-                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-                    )"""
-                )
-                await conn.execute(
-                    """CREATE TABLE IF NOT EXISTS compatibility_tests (
-                        id TEXT PRIMARY KEY,
-                        user_id TEXT NOT NULL,
-                        name TEXT,
-                        person_a JSONB NOT NULL,
-                        person_b JSONB NOT NULL,
-                        result JSONB NOT NULL,
-                        folder_id TEXT,
-                        accent_color TEXT,
-                        flagged BOOLEAN DEFAULT FALSE,
-                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-                    )"""
-                )
-                # Cross-type pair links — user pairs a spiral with a
-                # text-check, two compatibility tests, etc. a_type/b_type
-                # are one of: 'spiral' | 'text_check' | 'compatibility'.
-                # Symmetric: when reading we query both (a_type,a_id) and
-                # (b_type,b_id) to surface every link involving an item.
-                await conn.execute(
-                    """CREATE TABLE IF NOT EXISTS item_pairs (
-                        id TEXT PRIMARY KEY,
-                        user_id TEXT NOT NULL,
-                        a_type TEXT NOT NULL,
-                        a_id TEXT NOT NULL,
-                        b_type TEXT NOT NULL,
-                        b_id TEXT NOT NULL,
-                        note TEXT,
-                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-                    )"""
-                )
-                await conn.execute(
-                    "CREATE INDEX IF NOT EXISTS idx_item_pairs_a ON item_pairs (user_id, a_type, a_id)"
-                )
-                await conn.execute(
-                    "CREATE INDEX IF NOT EXISTS idx_item_pairs_b ON item_pairs (user_id, b_type, b_id)"
-                )
+                for name, sql in migrations:
+                    try:
+                        await conn.execute(sql)
+                        print(f"[lifespan] migration ✅ {name}")
+                    except Exception as inner:
+                        # Don't let one failure poison the rest. Log it
+                        # loudly so the next deploy surfaces it.
+                        print(f"[lifespan] migration ❌ {name}: {type(inner).__name__}: {inner}")
         except Exception as exc:
-            print(f"[lifespan] column-add migration warning: {exc}")
+            print(f"[lifespan] migration block error: {type(exc).__name__}: {exc}")
     yield
     if pool:
         await pool.close()
@@ -1485,6 +1453,79 @@ async def run_with_full_fallback(
     return None, None
 
 
+# ---------------------------------------------------------------------------
+# Archive table ensure-helpers
+# ---------------------------------------------------------------------------
+#
+# Lifespan attempts these creates on boot but lifespan can be skipped on
+# some platform-managed deployments (warm starts, fork-with-stale-DSN
+# scenarios, manual restarts of a pre-built image). These helpers are
+# called lazily before the first INSERT into each table so the table
+# exists no matter what. CREATE TABLE IF NOT EXISTS is cheap.
+
+_ARCHIVE_TABLES_READY = False
+
+async def _ensure_archive_tables():
+    """Defensive: make sure text_checks + compatibility_tests + item_pairs
+    exist before we INSERT into them. Idempotent and cached so it only
+    actually executes once per process lifetime in the happy path."""
+    global _ARCHIVE_TABLES_READY
+    if _ARCHIVE_TABLES_READY or pool is None:
+        return
+    statements = [
+        ("text_checks",
+            """CREATE TABLE IF NOT EXISTS text_checks (
+                id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                name TEXT,
+                draft TEXT NOT NULL,
+                context TEXT,
+                relationship TEXT,
+                result JSONB NOT NULL,
+                folder_id TEXT,
+                accent_color TEXT,
+                flagged BOOLEAN DEFAULT FALSE,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )"""),
+        ("compatibility_tests",
+            """CREATE TABLE IF NOT EXISTS compatibility_tests (
+                id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                name TEXT,
+                person_a JSONB NOT NULL,
+                person_b JSONB NOT NULL,
+                result JSONB NOT NULL,
+                folder_id TEXT,
+                accent_color TEXT,
+                flagged BOOLEAN DEFAULT FALSE,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )"""),
+        ("item_pairs",
+            """CREATE TABLE IF NOT EXISTS item_pairs (
+                id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                a_type TEXT NOT NULL,
+                a_id TEXT NOT NULL,
+                b_type TEXT NOT NULL,
+                b_id TEXT NOT NULL,
+                note TEXT,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )"""),
+        ("idx_item_pairs_a",
+            "CREATE INDEX IF NOT EXISTS idx_item_pairs_a ON item_pairs (user_id, a_type, a_id)"),
+        ("idx_item_pairs_b",
+            "CREATE INDEX IF NOT EXISTS idx_item_pairs_b ON item_pairs (user_id, b_type, b_id)"),
+    ]
+    async with pool.acquire() as conn:
+        for name, sql in statements:
+            try:
+                await conn.execute(sql)
+            except Exception as exc:
+                print(f"[ensure_archive_tables] ❌ {name}: {type(exc).__name__}: {exc}")
+    _ARCHIVE_TABLES_READY = True
+    print("[ensure_archive_tables] ✅ archive tables ready")
+
+
 def _strip_json_fences(text: str) -> str:
     """Strip ```json fences and pre/post prose the model sometimes wraps
     around JSON output. Defensive — feeds into json.loads downstream."""
@@ -1762,7 +1803,12 @@ async def compatibility(body: CompatRequest, user: dict = Depends(get_current_us
         raise HTTPException(400, "Both people need a name")
     result = await run_compat(body.person_a, body.person_b)
 
+    # Defensive: make sure the destination table exists in case the
+    # lifespan migration didn't run on this deploy.
+    await _ensure_archive_tables()
+
     saved_id = f"cp_{uuid.uuid4().hex[:14]}"
+    persist_error: Optional[str] = None
     try:
         async with pool.acquire() as conn:
             await conn.execute(
@@ -1774,11 +1820,15 @@ async def compatibility(body: CompatRequest, user: dict = Depends(get_current_us
                 json.dumps(body.person_b.model_dump()),
                 json.dumps(result),
             )
+        print(f"[compat] ✅ persisted {saved_id}")
     except Exception as e:
-        print(f"[compat] persist failed: {type(e).__name__}: {e}")
+        import traceback
+        persist_error = f"{type(e).__name__}: {str(e)[:200]}"
+        print(f"[compat] ❌ persist failed: {persist_error}")
+        traceback.print_exc()
         saved_id = None
 
-    return {"result": result, "saved_id": saved_id}
+    return {"result": result, "saved_id": saved_id, "persist_error": persist_error}
 
 
 # ---------------------------------------------------------------------------
@@ -1800,6 +1850,7 @@ async def list_compatibilities(
     user: dict = Depends(get_current_user),
 ):
     db_required()
+    await _ensure_archive_tables()
     where = ["user_id = $1"]
     args: List[Any] = [user["user_id"]]
     if folder_id == "__unfiled__":
@@ -2127,9 +2178,14 @@ async def text_check(body: TextCheckRequest, user: dict = Depends(get_current_us
         relationship=body.relationship or "someone",
     )
 
+    # Defensive: make sure the destination table exists in case the
+    # lifespan migration didn't run on this deploy.
+    await _ensure_archive_tables()
+
     # Persist — even fallback results are saved so the user keeps the
     # record of their draft. They can delete/rename/folder/pair it.
     saved_id = f"tc_{uuid.uuid4().hex[:14]}"
+    persist_error: Optional[str] = None
     try:
         async with pool.acquire() as conn:
             await conn.execute(
@@ -2140,13 +2196,18 @@ async def text_check(body: TextCheckRequest, user: dict = Depends(get_current_us
                 body.context or "", body.relationship or "someone",
                 json.dumps(result),
             )
+        print(f"[text-check] ✅ persisted {saved_id}")
     except Exception as e:
-        print(f"[text-check] persist failed: {type(e).__name__}: {e}")
+        import traceback
+        persist_error = f"{type(e).__name__}: {str(e)[:200]}"
+        print(f"[text-check] ❌ persist failed: {persist_error}")
+        traceback.print_exc()
         saved_id = None
 
     return {
         "result": result,
         "saved_id": saved_id,
+        "persist_error": persist_error,
         "usage": {
             "is_pro": True,
             "used_this_month": 0,
@@ -2177,6 +2238,7 @@ async def list_text_checks(
     user: dict = Depends(get_current_user),
 ):
     db_required()
+    await _ensure_archive_tables()
     where = ["user_id = $1"]
     args: List[Any] = [user["user_id"]]
     if folder_id == "__unfiled__":
@@ -3159,6 +3221,7 @@ async def _verify_item_owned(conn, item_type: str, item_id: str, user_id: str) -
 @app.post("/api/pairs")
 async def create_pair(body: PairCreate, user: dict = Depends(get_current_user)):
     db_required()
+    await _ensure_archive_tables()
     if body.a_type not in VALID_PAIR_TYPES or body.b_type not in VALID_PAIR_TYPES:
         raise HTTPException(400, "Invalid item type")
     if body.a_type == body.b_type and body.a_id == body.b_id:
@@ -3210,6 +3273,7 @@ async def list_pairs_for_item(item_type: str, item_id: str, user: dict = Depends
     partner item denormalised into the payload so the frontend can render
     a one-glance list without N+1 follow-up requests."""
     db_required()
+    await _ensure_archive_tables()
     if item_type not in VALID_PAIR_TYPES:
         raise HTTPException(400, "Invalid item type")
     async with pool.acquire() as conn:
@@ -4115,6 +4179,31 @@ async def dev_revoke_pro(user: dict = Depends(get_current_user)):
         )
         row = await conn.fetchrow("SELECT * FROM users WHERE user_id = $1", user["user_id"])
     return {"user": user_public(dict(row))}
+
+
+@app.get("/api/diag/db")
+async def diag_db():
+    """Browser-accessible: confirm archive tables exist + report row counts.
+    Lets us check from a phone whether text-check / compatibility saves
+    are actually landing in the DB."""
+    if pool is None:
+        return {"ok": False, "reason": "no_pool", "hint": "Set DATABASE_URL in backend/.env"}
+    # Try the lazy ensure first — if lifespan never ran, this creates
+    # the tables on the fly.
+    try:
+        await _ensure_archive_tables()
+    except Exception as exc:
+        return {"ok": False, "reason": "ensure_failed", "error": f"{type(exc).__name__}: {exc}"}
+    out: Dict[str, Any] = {"ok": True, "tables": {}}
+    async with pool.acquire() as conn:
+        for tbl in ("spirals", "folders", "text_checks", "compatibility_tests", "item_pairs", "users"):
+            try:
+                row = await conn.fetchrow(f"SELECT COUNT(*)::int AS n FROM {tbl}")
+                out["tables"][tbl] = {"exists": True, "rows": int(row["n"]) if row else 0}
+            except Exception as exc:
+                out["tables"][tbl] = {"exists": False, "error": f"{type(exc).__name__}: {str(exc)[:160]}"}
+                out["ok"] = False
+    return out
 
 
 @app.get("/api/diag/ai")
