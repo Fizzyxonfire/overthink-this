@@ -606,28 +606,39 @@ async def auth_me(user: dict = Depends(get_current_user)):
 # The frontend renders this as a 7×N/7 grid coloured by kind.
 @app.get("/api/streak/activity")
 async def get_streak_activity(days: int = 84, user: dict = Depends(get_current_user)):
-    db_required()
-    await _ensure_archive_tables()
-    days = max(7, min(int(days or 84), 365))  # clamp to sane range
+    """Heatmap data. Wrapped in defensive try/except so a missing
+    streak_activity table (pre-migration deploys) returns an all-miss
+    grid instead of 500'ing the profile screen."""
+    if pool is None:
+        # No DB at all (dev without DATABASE_URL). Return empty grid.
+        return _empty_streak_response(days, user)
+    days = max(7, min(int(days or 84), 365))
     today = datetime.now(timezone.utc).date()
     start = today - timedelta(days=days - 1)
     rows_by_date: Dict[str, dict] = {}
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            """SELECT activity_date::text AS d, kind,
-                      spiral_count, text_check_count, compat_count
-                 FROM streak_activity
-                WHERE user_id = $1 AND activity_date >= $2::date
-                ORDER BY activity_date ASC""",
-            user["user_id"], start.isoformat(),
-        )
-        for r in rows:
-            rows_by_date[r["d"]] = {
-                "kind": r["kind"],
-                "spiral": int(r["spiral_count"] or 0),
-                "text_check": int(r["text_check_count"] or 0),
-                "compat": int(r["compat_count"] or 0),
-            }
+    try:
+        await _ensure_archive_tables()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                """SELECT activity_date::text AS d, kind,
+                          spiral_count, text_check_count, compat_count
+                     FROM streak_activity
+                    WHERE user_id = $1 AND activity_date >= $2::date
+                    ORDER BY activity_date ASC""",
+                user["user_id"], start.isoformat(),
+            )
+            for r in rows:
+                rows_by_date[r["d"]] = {
+                    "kind": r["kind"],
+                    "spiral": int(r["spiral_count"] or 0),
+                    "text_check": int(r["text_check_count"] or 0),
+                    "compat": int(r["compat_count"] or 0),
+                }
+    except Exception as exc:
+        # Most likely: streak_activity table doesn't exist yet on this
+        # deploy. Log it but don't blow up the profile screen.
+        print(f"[streak/activity] read failed (returning empty grid): {type(exc).__name__}: {exc}")
+        rows_by_date = {}
     out = []
     for i in range(days):
         d = (start + timedelta(days=i)).isoformat()
@@ -644,6 +655,23 @@ async def get_streak_activity(days: int = 84, user: dict = Depends(get_current_u
                 "text_check": cell["text_check"],
                 "compat": cell["compat"],
             })
+    return {
+        "days": out,
+        "streak_count": int(user.get("streak_count") or 0),
+        "freezes_remaining": int(user.get("streak_freezes_remaining") or 0),
+        "is_pro": _is_pro_tier(user.get("plan_tier")),
+    }
+
+
+def _empty_streak_response(days: int, user: dict) -> dict:
+    days = max(7, min(int(days or 84), 365))
+    today = datetime.now(timezone.utc).date()
+    start = today - timedelta(days=days - 1)
+    out = [{
+        "date": (start + timedelta(days=i)).isoformat(),
+        "kind": "miss", "total": 0,
+        "spiral": 0, "text_check": 0, "compat": 0,
+    } for i in range(days)]
     return {
         "days": out,
         "streak_count": int(user.get("streak_count") or 0),
@@ -702,24 +730,32 @@ async def update_customization(body: CustomizeRequest, user: dict = Depends(get_
             unlocked = json.loads(unlocked)
         except Exception:
             unlocked = []
-    requested = {}
-    if body.active_title is not None:
+    # IMPORTANT: distinguish "field absent" from "field explicitly null".
+    # An explicit null means "unequip this back to default". An absent
+    # field means "don't touch this". Pydantic's model_fields_set gives
+    # us exactly that distinction.
+    try:
+        fields_set = body.model_fields_set
+    except Exception:
+        fields_set = {k for k, v in body.model_dump(exclude_unset=True).items()}
+
+    requested: Dict[str, Optional[str]] = {}
+    if "active_title" in fields_set:
         if body.active_title and f"title:{body.active_title}" not in unlocked:
             raise HTTPException(403, "Title not unlocked")
+        # body.active_title may be None — that's the "unequip" path.
         requested["active_title"] = body.active_title
-    if body.name_color is not None:
-        # Default colors (white #F4F3F7, black #161520) are ALWAYS allowed,
-        # plus null which clears the choice. Everything else needs unlock.
+    if "name_color" in fields_set:
         DEFAULT_COLORS = {"#F4F3F7", "#161520"}
         if (body.name_color
             and body.name_color not in DEFAULT_COLORS
             and f"name_color:{body.name_color}" not in unlocked):
             raise HTTPException(403, "Name color not unlocked")
-        requested["name_color"] = body.name_color
-    if body.card_theme is not None:
+        requested["name_color"] = body.name_color  # None → unequip
+    if "card_theme" in fields_set:
         if body.card_theme and body.card_theme != "dark" and f"card_theme:{body.card_theme}" not in unlocked:
             raise HTTPException(403, "Card theme not unlocked")
-        requested["card_theme"] = body.card_theme
+        requested["card_theme"] = body.card_theme  # None → unequip
 
     current = user.get("customization") or {}
     if isinstance(current, str):
@@ -727,7 +763,13 @@ async def update_customization(body: CustomizeRequest, user: dict = Depends(get_
             current = json.loads(current)
         except Exception:
             current = {}
-    current.update({k: v for k, v in requested.items() if v is not None})
+    # Apply ALL requested changes — including explicit None, which means
+    # "remove this key" so user_public returns null on the GET.
+    for k, v in requested.items():
+        if v is None:
+            current.pop(k, None)
+        else:
+            current[k] = v
 
     async with pool.acquire() as conn:
         await conn.execute(
