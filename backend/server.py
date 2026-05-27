@@ -134,6 +134,20 @@ async def lifespan(_: FastAPI):
                 "CREATE INDEX IF NOT EXISTS idx_item_pairs_a ON item_pairs (user_id, a_type, a_id)"),
             ("idx_item_pairs_b",
                 "CREATE INDEX IF NOT EXISTS idx_item_pairs_b ON item_pairs (user_id, b_type, b_id)"),
+            # Streak activity grid (heatmap) — one row per user per
+            # date. Records active days and freeze-rescued days.
+            ("streak_activity",
+                """CREATE TABLE IF NOT EXISTS streak_activity (
+                    user_id TEXT NOT NULL,
+                    activity_date DATE NOT NULL,
+                    kind TEXT NOT NULL DEFAULT 'active',
+                    spiral_count INTEGER NOT NULL DEFAULT 0,
+                    text_check_count INTEGER NOT NULL DEFAULT 0,
+                    compat_count INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (user_id, activity_date)
+                )"""),
+            ("idx_streak_activity_user_date",
+                "CREATE INDEX IF NOT EXISTS idx_streak_activity_user_date ON streak_activity (user_id, activity_date DESC)"),
         ]
         try:
             async with pool.acquire() as conn:
@@ -578,6 +592,64 @@ async def auth_google(body: GoogleRequest, request: Request, response: Response)
 @app.get("/api/auth/me")
 async def auth_me(user: dict = Depends(get_current_user)):
     return {"user": user_public(user)}
+
+
+# ---------------------------------------------------------------------------
+# Streak activity grid — GitHub-style heatmap data
+# ---------------------------------------------------------------------------
+#
+# Returns the most recent N days as a chronological list of
+# {date, kind, total} entries. kind is one of:
+#   • "active"   — user logged at least one item that day
+#   • "freeze"   — gap day rescued by a Pro streak freeze
+#   • "miss"     — no activity, no freeze (just empty)
+# The frontend renders this as a 7×N/7 grid coloured by kind.
+@app.get("/api/streak/activity")
+async def get_streak_activity(days: int = 84, user: dict = Depends(get_current_user)):
+    db_required()
+    await _ensure_archive_tables()
+    days = max(7, min(int(days or 84), 365))  # clamp to sane range
+    today = datetime.now(timezone.utc).date()
+    start = today - timedelta(days=days - 1)
+    rows_by_date: Dict[str, dict] = {}
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT activity_date::text AS d, kind,
+                      spiral_count, text_check_count, compat_count
+                 FROM streak_activity
+                WHERE user_id = $1 AND activity_date >= $2::date
+                ORDER BY activity_date ASC""",
+            user["user_id"], start.isoformat(),
+        )
+        for r in rows:
+            rows_by_date[r["d"]] = {
+                "kind": r["kind"],
+                "spiral": int(r["spiral_count"] or 0),
+                "text_check": int(r["text_check_count"] or 0),
+                "compat": int(r["compat_count"] or 0),
+            }
+    out = []
+    for i in range(days):
+        d = (start + timedelta(days=i)).isoformat()
+        cell = rows_by_date.get(d)
+        if cell is None:
+            out.append({"date": d, "kind": "miss", "total": 0, "spiral": 0, "text_check": 0, "compat": 0})
+        else:
+            total = cell["spiral"] + cell["text_check"] + cell["compat"]
+            out.append({
+                "date": d,
+                "kind": cell["kind"],
+                "total": total,
+                "spiral": cell["spiral"],
+                "text_check": cell["text_check"],
+                "compat": cell["compat"],
+            })
+    return {
+        "days": out,
+        "streak_count": int(user.get("streak_count") or 0),
+        "freezes_remaining": int(user.get("streak_freezes_remaining") or 0),
+        "is_pro": _is_pro_tier(user.get("plan_tier")),
+    }
 
 
 @app.post("/api/auth/logout")
@@ -1465,65 +1537,119 @@ async def run_with_full_fallback(
 
 _ARCHIVE_TABLES_READY = False
 
-async def _ensure_archive_tables():
-    """Defensive: make sure text_checks + compatibility_tests + item_pairs
-    exist before we INSERT into them. Idempotent and cached so it only
-    actually executes once per process lifetime in the happy path."""
+_ARCHIVE_TABLE_STATEMENTS: List[tuple[str, str]] = [
+    ("text_checks",
+        """CREATE TABLE IF NOT EXISTS text_checks (
+            id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            name TEXT,
+            draft TEXT NOT NULL,
+            context TEXT,
+            relationship TEXT,
+            result JSONB NOT NULL,
+            folder_id TEXT,
+            accent_color TEXT,
+            flagged BOOLEAN DEFAULT FALSE,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )"""),
+    ("compatibility_tests",
+        """CREATE TABLE IF NOT EXISTS compatibility_tests (
+            id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            name TEXT,
+            person_a JSONB NOT NULL,
+            person_b JSONB NOT NULL,
+            result JSONB NOT NULL,
+            folder_id TEXT,
+            accent_color TEXT,
+            flagged BOOLEAN DEFAULT FALSE,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )"""),
+    ("item_pairs",
+        """CREATE TABLE IF NOT EXISTS item_pairs (
+            id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            a_type TEXT NOT NULL,
+            a_id TEXT NOT NULL,
+            b_type TEXT NOT NULL,
+            b_id TEXT NOT NULL,
+            note TEXT,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )"""),
+    ("idx_item_pairs_a",
+        "CREATE INDEX IF NOT EXISTS idx_item_pairs_a ON item_pairs (user_id, a_type, a_id)"),
+    ("idx_item_pairs_b",
+        "CREATE INDEX IF NOT EXISTS idx_item_pairs_b ON item_pairs (user_id, b_type, b_id)"),
+    # Daily activity grid — one row per (user, date). kind is "active"
+    # when the user did any item that day, or "freeze" when a freeze
+    # was burned to bridge that date. Counts let us render heatmap
+    # intensity later. Driven by bump_activity_streak below.
+    ("streak_activity",
+        """CREATE TABLE IF NOT EXISTS streak_activity (
+            user_id TEXT NOT NULL,
+            activity_date DATE NOT NULL,
+            kind TEXT NOT NULL DEFAULT 'active',
+            spiral_count INTEGER NOT NULL DEFAULT 0,
+            text_check_count INTEGER NOT NULL DEFAULT 0,
+            compat_count INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (user_id, activity_date)
+        )"""),
+    ("idx_streak_activity_user_date",
+        "CREATE INDEX IF NOT EXISTS idx_streak_activity_user_date ON streak_activity (user_id, activity_date DESC)"),
+]
+
+
+async def _ensure_archive_tables(force: bool = False) -> bool:
+    """Defensive: make sure text_checks + compatibility_tests + item_pairs +
+    streak_activity exist before we INSERT into them. Returns True iff
+    every statement succeeded. Only caches the success when truly all
+    statements succeeded — partial failures keep retrying on next call
+    so a transient blip doesn't permanently break saves."""
     global _ARCHIVE_TABLES_READY
-    if _ARCHIVE_TABLES_READY or pool is None:
-        return
-    statements = [
-        ("text_checks",
-            """CREATE TABLE IF NOT EXISTS text_checks (
-                id TEXT PRIMARY KEY,
-                user_id TEXT NOT NULL,
-                name TEXT,
-                draft TEXT NOT NULL,
-                context TEXT,
-                relationship TEXT,
-                result JSONB NOT NULL,
-                folder_id TEXT,
-                accent_color TEXT,
-                flagged BOOLEAN DEFAULT FALSE,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            )"""),
-        ("compatibility_tests",
-            """CREATE TABLE IF NOT EXISTS compatibility_tests (
-                id TEXT PRIMARY KEY,
-                user_id TEXT NOT NULL,
-                name TEXT,
-                person_a JSONB NOT NULL,
-                person_b JSONB NOT NULL,
-                result JSONB NOT NULL,
-                folder_id TEXT,
-                accent_color TEXT,
-                flagged BOOLEAN DEFAULT FALSE,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            )"""),
-        ("item_pairs",
-            """CREATE TABLE IF NOT EXISTS item_pairs (
-                id TEXT PRIMARY KEY,
-                user_id TEXT NOT NULL,
-                a_type TEXT NOT NULL,
-                a_id TEXT NOT NULL,
-                b_type TEXT NOT NULL,
-                b_id TEXT NOT NULL,
-                note TEXT,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            )"""),
-        ("idx_item_pairs_a",
-            "CREATE INDEX IF NOT EXISTS idx_item_pairs_a ON item_pairs (user_id, a_type, a_id)"),
-        ("idx_item_pairs_b",
-            "CREATE INDEX IF NOT EXISTS idx_item_pairs_b ON item_pairs (user_id, b_type, b_id)"),
-    ]
+    if (_ARCHIVE_TABLES_READY and not force) or pool is None:
+        return _ARCHIVE_TABLES_READY
+    all_ok = True
     async with pool.acquire() as conn:
-        for name, sql in statements:
+        for name, sql in _ARCHIVE_TABLE_STATEMENTS:
             try:
                 await conn.execute(sql)
             except Exception as exc:
+                all_ok = False
                 print(f"[ensure_archive_tables] ❌ {name}: {type(exc).__name__}: {exc}")
-    _ARCHIVE_TABLES_READY = True
-    print("[ensure_archive_tables] ✅ archive tables ready")
+    if all_ok:
+        _ARCHIVE_TABLES_READY = True
+        print("[ensure_archive_tables] ✅ archive tables ready")
+    else:
+        print("[ensure_archive_tables] ⚠️  some statements failed; will retry on next call")
+    return all_ok
+
+
+async def _insert_with_ensure(conn_query_fn, *args, table_label: str) -> Optional[str]:
+    """Run an INSERT; if it fails with UndefinedTable (relation doesn't
+    exist), force-run the ensure helper and retry exactly once. Returns
+    the error string or None on success. Centralises the retry so every
+    save endpoint gets the same treatment."""
+    try:
+        await conn_query_fn(*args)
+        return None
+    except Exception as e:
+        msg = f"{type(e).__name__}: {str(e)[:200]}"
+        # asyncpg.UndefinedTableError + generic Postgres-flavored
+        # "relation X does not exist" both should trigger the recovery.
+        if "UndefinedTable" in type(e).__name__ or "does not exist" in str(e).lower():
+            print(f"[{table_label}] INSERT hit schema gap, force-ensuring tables and retrying…")
+            await _ensure_archive_tables(force=True)
+            try:
+                await conn_query_fn(*args)
+                print(f"[{table_label}] ✅ retry succeeded after ensure")
+                return None
+            except Exception as e2:
+                msg2 = f"{type(e2).__name__}: {str(e2)[:200]}"
+                print(f"[{table_label}] ❌ retry also failed: {msg2}")
+                import traceback; traceback.print_exc()
+                return msg2
+        import traceback; traceback.print_exc()
+        return msg
 
 
 def _strip_json_fences(text: str) -> str:
@@ -1808,8 +1934,8 @@ async def compatibility(body: CompatRequest, user: dict = Depends(get_current_us
     await _ensure_archive_tables()
 
     saved_id = f"cp_{uuid.uuid4().hex[:14]}"
-    persist_error: Optional[str] = None
-    try:
+
+    async def _do_insert():
         async with pool.acquire() as conn:
             await conn.execute(
                 """INSERT INTO compatibility_tests
@@ -1820,12 +1946,21 @@ async def compatibility(body: CompatRequest, user: dict = Depends(get_current_us
                 json.dumps(body.person_b.model_dump()),
                 json.dumps(result),
             )
+
+    persist_error = await _insert_with_ensure(_do_insert, table_label="compat")
+    if persist_error is None:
         print(f"[compat] ✅ persisted {saved_id}")
-    except Exception as e:
-        import traceback
-        persist_error = f"{type(e).__name__}: {str(e)[:200]}"
-        print(f"[compat] ❌ persist failed: {persist_error}")
-        traceback.print_exc()
+        # Streak counts compatibility tests too — bump the day streak
+        # and the activity grid. Fresh user dict for accurate freezes.
+        try:
+            await bump_activity_streak(user, source="compatibility")
+        except Exception as se:
+            print(f"[compat] streak bump failed (non-fatal): {se}")
+        try:
+            await progress_for_event(user, {"kind": "compat_created"})
+        except Exception as te:
+            print(f"[compat] task progress failed (non-fatal): {te}")
+    else:
         saved_id = None
 
     return {"result": result, "saved_id": saved_id, "persist_error": persist_error}
@@ -2185,8 +2320,8 @@ async def text_check(body: TextCheckRequest, user: dict = Depends(get_current_us
     # Persist — even fallback results are saved so the user keeps the
     # record of their draft. They can delete/rename/folder/pair it.
     saved_id = f"tc_{uuid.uuid4().hex[:14]}"
-    persist_error: Optional[str] = None
-    try:
+
+    async def _do_insert():
         async with pool.acquire() as conn:
             await conn.execute(
                 """INSERT INTO text_checks
@@ -2196,12 +2331,19 @@ async def text_check(body: TextCheckRequest, user: dict = Depends(get_current_us
                 body.context or "", body.relationship or "someone",
                 json.dumps(result),
             )
+
+    persist_error = await _insert_with_ensure(_do_insert, table_label="text-check")
+    if persist_error is None:
         print(f"[text-check] ✅ persisted {saved_id}")
-    except Exception as e:
-        import traceback
-        persist_error = f"{type(e).__name__}: {str(e)[:200]}"
-        print(f"[text-check] ❌ persist failed: {persist_error}")
-        traceback.print_exc()
+        try:
+            await bump_activity_streak(user, source="text_check")
+        except Exception as se:
+            print(f"[text-check] streak bump failed (non-fatal): {se}")
+        try:
+            await progress_for_event(user, {"kind": "text_check_created"})
+        except Exception as te:
+            print(f"[text-check] task progress failed (non-fatal): {te}")
+    else:
         saved_id = None
 
     return {
@@ -2403,6 +2545,10 @@ DAILY_TASKS = [
     {"task_id": "long_spiral", "label": "Write a 100+ word spiral", "xp": 60, "target": 1},
     {"task_id": "share_verdict", "label": "Share a verdict", "xp": 40, "target": 1},
     {"task_id": "plot_twist", "label": "Log a plot-twist resolution", "xp": 80, "target": 1},
+    # Pro feature tasks — count text-check and compatibility usage as
+    # daily wins so the gamification reaches every part of the app.
+    {"task_id": "one_text_check", "label": "Stop one text from going out", "xp": 60, "target": 1},
+    {"task_id": "one_compat", "label": "Run a compatibility test", "xp": 60, "target": 1},
 ]
 
 WEEKLY_TASKS = [
@@ -2414,6 +2560,10 @@ WEEKLY_TASKS = [
     {"task_id": "share_three", "label": "Share 3 verdicts", "xp": 250, "target": 3},
     {"task_id": "gentle_three", "label": "Use the Gentle tone 3x", "xp": 180, "target": 3},
     {"task_id": "three_streak", "label": "Hit a 3-day streak", "xp": 200, "target": 3},
+    # Cross-feature weekly goals.
+    {"task_id": "three_text_checks", "label": "Run 3 text-checks", "xp": 280, "target": 3},
+    {"task_id": "two_compats", "label": "Run 2 compatibility tests", "xp": 240, "target": 2},
+    {"task_id": "all_three_kinds", "label": "Use all 3 tools (spiral / text / compat)", "xp": 350, "target": 3},
 ]
 
 
@@ -2468,6 +2618,7 @@ async def progress_for_event(user: dict, event: dict) -> None:
     if kind == "spiral_created":
         await bump_task(user["user_id"], "first_spiral", day)
         await bump_task(user["user_id"], "seven_spirals", week)
+        await _bump_all_three_kinds(user["user_id"], week, "spiral")
         tone = event.get("tone")
         if tone == "brutal":
             await bump_task(user["user_id"], "brutal_tone", day)
@@ -2526,6 +2677,41 @@ async def progress_for_event(user: dict, event: dict) -> None:
         await bump_task(user["user_id"], "share_verdict", day)
         await bump_task(user["user_id"], "share_three", week)
 
+    elif kind == "text_check_created":
+        await bump_task(user["user_id"], "one_text_check", day)
+        await bump_task(user["user_id"], "three_text_checks", week)
+        await _bump_all_three_kinds(user["user_id"], week, "text_check")
+
+    elif kind == "compat_created":
+        await bump_task(user["user_id"], "one_compat", day)
+        await bump_task(user["user_id"], "two_compats", week)
+        await _bump_all_three_kinds(user["user_id"], week, "compat")
+
+    # Cross-task: the spiral_created branch above also needs to record
+    # the "spiral" kind for the all-three weekly. Inlined there.
+
+
+async def _bump_all_three_kinds(user_id: str, week: str, kind: str) -> None:
+    """Track which of {spiral, text_check, compat} the user has used
+    this week. Stored as a JSON list on the task row so we can detect
+    "saw all three" without a separate table."""
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT tones_used FROM user_tasks WHERE user_id = $1 AND task_id = 'all_three_kinds' AND period = $2",
+            user_id, week,
+        )
+        seen = list(row["tones_used"] or []) if row else []
+        if isinstance(seen, str):
+            try: seen = json.loads(seen)
+            except Exception: seen = []
+        if kind not in seen:
+            seen.append(kind)
+            await conn.execute(
+                "UPDATE user_tasks SET tones_used = $1, progress = LEAST($2, target) "
+                "WHERE user_id = $3 AND task_id = 'all_three_kinds' AND period = $4",
+                json.dumps(seen), len(seen), user_id, week,
+            )
+
 
 # ---------------------------------------------------------------------------
 # Streak handling
@@ -2565,6 +2751,94 @@ def _is_pro_tier(plan_tier: Optional[str]) -> bool:
     return (plan_tier or "free") in {"pro_weekly", "pro_monthly", "pro_yearly", "lifetime"}
 
 
+async def _record_streak_activity(
+    conn,
+    user_id: str,
+    today_iso: str,
+    source: str,
+    freeze_dates: List[str],
+) -> None:
+    """Upsert today's activity row + record any freeze-rescued dates.
+    `source` is one of 'spiral' | 'text_check' | 'compatibility' — drives
+    which per-type counter increments. Designed to be called from inside
+    an existing conn block to avoid extra pool acquires."""
+    col = {
+        "spiral": "spiral_count",
+        "text_check": "text_check_count",
+        "compatibility": "compat_count",
+    }.get(source, "spiral_count")
+    try:
+        await conn.execute(
+            f"""INSERT INTO streak_activity (user_id, activity_date, kind, {col})
+                  VALUES ($1, $2::date, 'active', 1)
+                ON CONFLICT (user_id, activity_date) DO UPDATE
+                  SET {col} = streak_activity.{col} + 1,
+                      kind = CASE WHEN streak_activity.kind = 'freeze' THEN 'active' ELSE streak_activity.kind END""",
+            user_id, today_iso,
+        )
+        for d in freeze_dates:
+            await conn.execute(
+                """INSERT INTO streak_activity (user_id, activity_date, kind)
+                       VALUES ($1, $2::date, 'freeze')
+                       ON CONFLICT (user_id, activity_date) DO NOTHING""",
+                user_id, d,
+            )
+    except Exception as exc:
+        # Non-fatal — log and move on so a streak_activity outage can't
+        # block the actual save.
+        print(f"[streak_activity] write failed: {type(exc).__name__}: {exc}")
+
+
+async def bump_activity_streak(user: dict, *, source: str) -> None:
+    """Generic day-streak bumper. Called from text-check and
+    compatibility endpoints (and indirectly by spiral via the
+    bump_streak_and_total path). Doesn't touch spirals_used_today /
+    spirals_total — those are spiral-specific and stay in
+    bump_streak_and_total. Records streak_activity for the heatmap."""
+    today = today_iso_date()
+    last = user.get("last_spiral_date")
+    streak = user.get("streak_count") or 0
+    diff = _date_diff_days(last, today)
+
+    freezes_remaining, freeze_month = _streak_freeze_state(user)
+    pro = _is_pro_tier(user.get("plan_tier"))
+    freeze_dates: List[str] = []
+
+    if diff == 0:
+        new_streak = streak or 1
+    elif diff == 1:
+        new_streak = streak + 1
+    elif diff is not None and 2 <= diff <= 4 and pro and freezes_remaining >= (diff - 1):
+        # Bridge — record each rescued date so the heatmap shows the
+        # freeze tile for that day.
+        try:
+            today_date = datetime.fromisoformat(today).date()
+            for d in range(1, diff):
+                freeze_dates.append((today_date - timedelta(days=d)).isoformat())
+        except Exception:
+            pass
+        freezes_remaining -= max(0, diff - 1)
+        new_streak = streak + 1
+    else:
+        new_streak = 1
+
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """UPDATE users SET
+                  streak_count = $1,
+                  last_active = $2,
+                  last_spiral_date = $3,
+                  streak_freezes_remaining = $4,
+                  streak_freezes_month = $5
+                WHERE user_id = $6""",
+            new_streak, now_iso(), today,
+            freezes_remaining, freeze_month, user["user_id"],
+        )
+        await _record_streak_activity(conn, user["user_id"], today, source, freeze_dates)
+    if freeze_dates:
+        print(f"[streak] burned {len(freeze_dates)} freeze(s) for {user['user_id']} via {source}")
+
+
 async def bump_streak_and_total(user: dict) -> dict:
     """Called on every successful spiral creation. Bumps the day counter,
     advances the streak if it's consecutive, and burns Pro freezes to
@@ -2589,6 +2863,7 @@ async def bump_streak_and_total(user: dict) -> dict:
     freezes_remaining, freeze_month = _streak_freeze_state(user)
     pro = _is_pro_tier(user.get("plan_tier"))
     freezes_burned = 0
+    freeze_dates: List[str] = []
 
     if diff == 0:
         new_streak = streak or 1
@@ -2599,6 +2874,12 @@ async def bump_streak_and_total(user: dict) -> dict:
         freezes_burned = diff - 1
         freezes_remaining -= freezes_burned
         new_streak = streak + 1
+        try:
+            today_date = datetime.fromisoformat(today).date()
+            for d in range(1, diff):
+                freeze_dates.append((today_date - timedelta(days=d)).isoformat())
+        except Exception:
+            pass
     else:
         new_streak = 1
 
@@ -2625,6 +2906,9 @@ async def bump_streak_and_total(user: dict) -> dict:
         )
         if freezes_burned > 0:
             print(f"[streak] burned {freezes_burned} freeze(s) for user {user['user_id']} (gap {diff} days)")
+        # Record this spiral in the streak heatmap (active today + any
+        # freeze-rescued dates).
+        await _record_streak_activity(conn, user["user_id"], today, "spiral", freeze_dates)
         return dict(await conn.fetchrow("SELECT * FROM users WHERE user_id = $1", user["user_id"]))
 
 
