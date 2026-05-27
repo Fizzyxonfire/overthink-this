@@ -2067,6 +2067,47 @@ async def delete_compatibility(cp_id: str, user: dict = Depends(get_current_user
     return {"ok": True}
 
 
+class CompatSaveRequest(BaseModel):
+    person_a: CompatPerson
+    person_b: CompatPerson
+    result: Dict[str, Any]
+    name: Optional[str] = None
+
+
+@app.post("/api/compatibilities")
+async def manual_save_compat(body: CompatSaveRequest, user: dict = Depends(get_current_user)):
+    """Manual-save companion to POST /api/compatibility. Accepts a
+    pre-computed result so the frontend can retry a failed auto-save
+    without re-running the AI."""
+    db_required()
+    if user.get("is_guest"):
+        raise HTTPException(403, "Sign in to save")
+    if not _is_pro_tier(user.get("plan_tier")):
+        raise HTTPException(403, "Pro required")
+    await _ensure_archive_tables()
+    if not body.person_a.name.strip() or not body.person_b.name.strip():
+        raise HTTPException(400, "Both people need a name")
+    saved_id = f"cp_{uuid.uuid4().hex[:14]}"
+
+    async def _do_insert():
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """INSERT INTO compatibility_tests
+                       (id, user_id, name, person_a, person_b, result, created_at)
+                   VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, $6::jsonb, NOW())""",
+                saved_id, user["user_id"], (body.name or None),
+                json.dumps(body.person_a.model_dump()),
+                json.dumps(body.person_b.model_dump()),
+                json.dumps(body.result),
+            )
+
+    err = await _insert_with_ensure(_do_insert, table_label="compat-manual")
+    if err:
+        raise HTTPException(500, f"Save failed: {err}")
+    print(f"[compat-manual] ✅ persisted {saved_id}")
+    return {"compatibility_id": saved_id}
+
+
 # ---------------------------------------------------------------------------
 # Text-Check ("Don't send that text") — pre-send draft analyzer
 #
@@ -2461,6 +2502,49 @@ async def delete_text_check(tc_id: str, user: dict = Depends(get_current_user)):
     if result.endswith("0"):
         raise HTTPException(404, "Text-check not found")
     return {"ok": True}
+
+
+# Manual save — accepts a pre-computed result so the frontend can
+# retry persistence after auto-save failed without re-running the AI.
+# Different path from POST /api/text-check (which RUNS the AI) so we
+# don't accidentally double-bill on retries.
+class TextCheckSaveRequest(BaseModel):
+    draft: str
+    context: Optional[str] = ""
+    relationship: Optional[str] = "someone"
+    result: Dict[str, Any]
+    name: Optional[str] = None
+
+
+@app.post("/api/text-checks")
+async def manual_save_text_check(body: TextCheckSaveRequest, user: dict = Depends(get_current_user)):
+    db_required()
+    if user.get("is_guest"):
+        raise HTTPException(403, "Sign in to save")
+    if not _is_pro_tier(user.get("plan_tier")):
+        raise HTTPException(403, "Pro required")
+    await _ensure_archive_tables()
+    draft = (body.draft or "").strip()
+    if not draft:
+        raise HTTPException(400, "Draft is empty")
+    saved_id = f"tc_{uuid.uuid4().hex[:14]}"
+
+    async def _do_insert():
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """INSERT INTO text_checks
+                       (id, user_id, name, draft, context, relationship, result, created_at)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, NOW())""",
+                saved_id, user["user_id"], (body.name or None),
+                draft, body.context or "", body.relationship or "someone",
+                json.dumps(body.result),
+            )
+
+    err = await _insert_with_ensure(_do_insert, table_label="text-check-manual")
+    if err:
+        raise HTTPException(500, f"Save failed: {err}")
+    print(f"[text-check-manual] ✅ persisted {saved_id}")
+    return {"text_check_id": saved_id}
 
 
 # ---------------------------------------------------------------------------
