@@ -64,10 +64,160 @@ function userPublic(u: any) {
 }
 
 // ── action handlers ─────────────────────────────────────────────────────
-type Ctx = { user: any; body: any };
+// ── XP / level curve (port of server.py) ────────────────────────────────
+function xpForLevel(level: number): number {
+  if (level < 1) return 200;
+  if (level <= 5) return 200;
+  if (level <= 10) return 500;
+  if (level <= 20) return 1200;
+  if (level <= 35) return 3000;
+  if (level <= 50) return 6500;
+  if (level <= 70) return 12000;
+  if (level <= 85) return 22000;
+  return 38000;
+}
+function totalXpForLevel(level: number): number {
+  let t = 0;
+  for (let lv = 1; lv < level; lv++) t += xpForLevel(lv);
+  return t;
+}
+function levelFromXp(xp: number): number {
+  let lv = 1;
+  while (lv < 100 && totalXpForLevel(lv + 1) <= xp) lv++;
+  return lv;
+}
+const LEVEL_UNLOCKS: [number, string, string, string][] = [
+  [5, "title", "The Apprentice", "Title: The Apprentice"],
+  [10, "name_color", "#C8A0DC", "Lilac name colour"],
+  [15, "card_theme", "midnight", "Midnight share-card theme"],
+  [20, "title", "The Worrier", "Title: The Worrier"],
+  [25, "name_color", "#F5C518", "Gold name colour"],
+  [30, "card_theme", "warm", "Warm Ember share-card theme"],
+  [35, "title", "The Analyst", "Title: The Analyst"],
+  [40, "name_color", "#4FC3F7", "Ocean name colour"],
+  [45, "card_theme", "forest", "Deep Forest share-card theme"],
+  [50, "title", "Spiral Veteran", "Title: Spiral Veteran"],
+  [55, "name_color", "#E24B4A", "Crimson name colour"],
+  [60, "card_theme", "aurora", "Aurora Borealis share-card theme"],
+  [65, "title", "The Philosopher", "Title: The Philosopher"],
+  [70, "name_color", "#34A56F", "Moss name colour"],
+  [75, "title", "The Oracle", "Title: The Oracle"],
+  [80, "name_color", "#FF8C42", "Ember name colour"],
+  [85, "card_theme", "neon", "Neon Noir share-card theme"],
+  [90, "title", "Mind Cartographer", "Title: Mind Cartographer"],
+  [95, "title", "Overthinking Champion", "Title: Overthinking Champion"],
+  [100, "title", "Overthinker Supreme", "Title: Overthinker Supreme"],
+];
+
+async function createSession(userId: string): Promise<string> {
+  const token = (crypto.randomUUID() + crypto.randomUUID()).replace(/-/g, "");
+  const expires = new Date(Date.now() + 30 * 24 * 3600 * 1000).toISOString();
+  await db.from("sessions").insert({ session_token: token, user_id: userId, expires_at: expires, created_at: nowIso() });
+  return token;
+}
+
+type Ctx = { user: any; body: any; req: Request };
+
+// Actions callable WITHOUT a session token (login).
+const UNAUTHED = new Set(["auth.guest", "auth.google"]);
 
 const handlers: Record<string, (c: Ctx) => Promise<Response>> = {
-  // ---- auth ----
+  // ---- auth / login ----
+  "auth.guest": async ({ body, req }) => {
+    const ip = (req.headers.get("x-forwarded-for") ?? "").split(",")[0].trim() || "0.0.0.0";
+    const cutoff = new Date(Date.now() - 24 * 3600 * 1000).toISOString();
+    const { count } = await db.from("users").select("user_id", { count: "exact", head: true })
+      .eq("is_guest", true).eq("ip_address", ip).gt("created_at", cutoff);
+    if ((count ?? 0) >= 5) return json({ detail: "Too many guest accounts from this IP. Please sign in instead." }, 429);
+    const uid = `guest_${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`;
+    await db.from("users").insert({
+      user_id: uid, name: body.name || "Guest", is_guest: true, plan_tier: "free",
+      created_at: nowIso(), ip_address: ip, last_active: nowIso(), customization: {}, unlocked_items: [],
+    });
+    const { data: u } = await db.from("users").select("*").eq("user_id", uid).single();
+    const token = await createSession(uid);
+    return json({ user: userPublic(u), session_token: token });
+  },
+  "auth.google": async ({ body, req }) => {
+    let info: any;
+    try {
+      const r = await fetch("https://www.googleapis.com/oauth2/v3/userinfo", {
+        headers: { Authorization: `Bearer ${body.access_token}` },
+      });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      info = await r.json();
+    } catch (e) {
+      return json({ detail: `Google auth failed: ${e}` }, 401);
+    }
+    const email = info.email;
+    if (!email) return json({ detail: "Google profile missing email" }, 401);
+    const name = info.name || String(email).split("@")[0];
+    const picture = info.picture ?? null;
+    const ip = (req.headers.get("x-forwarded-for") ?? "").split(",")[0].trim() || null;
+    const newId = `user_${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`;
+    const { data: existing } = await db.from("users").select("*").eq("email", email).maybeSingle();
+    let u = existing;
+    if (existing) {
+      await db.from("users").update({ name, picture, last_active: nowIso() }).eq("email", email);
+      const { data } = await db.from("users").select("*").eq("email", email).single();
+      u = data;
+    } else {
+      await db.from("users").insert({
+        user_id: newId, email, name, picture, is_guest: false, plan_tier: "free",
+        created_at: nowIso(), ip_address: ip, last_active: nowIso(), customization: {}, unlocked_items: [],
+      });
+      const { data } = await db.from("users").select("*").eq("email", email).single();
+      u = data;
+    }
+    const token = await createSession(u.user_id);
+    return json({ user: userPublic(u), session_token: token });
+  },
+  "auth.logout": async ({ req }) => {
+    const auth = req.headers.get("authorization") ?? "";
+    const token = auth.toLowerCase().startsWith("bearer ") ? auth.slice(7).trim() : "";
+    if (token) await db.from("sessions").delete().eq("session_token", token);
+    return json({ ok: true });
+  },
+
+  // ---- level / XP ----
+  "level": async ({ user }) => {
+    const xp = user.xp ?? 0;
+    const level = levelFromXp(xp);
+    const startXp = totalXpForLevel(level);
+    const endXp = level < 100 ? totalXpForLevel(level + 1) : startXp;
+    const xpInLevel = xp - startXp;
+    const xpNeeded = Math.max(endXp - startXp, 1);
+    const pct = Math.round(Math.min(xpInLevel / xpNeeded, 1) * 100);
+    let unlocked = user.unlocked_items ?? [];
+    if (typeof unlocked === "string") { try { unlocked = JSON.parse(unlocked); } catch { unlocked = []; } }
+    const upcoming = [];
+    for (const [lv, kind, value, label] of LEVEL_UNLOCKS) {
+      if (lv > level) upcoming.push({ level: lv, kind, value, label });
+      if (upcoming.length >= 5) break;
+    }
+    return json({
+      level, xp, xp_in_level: xpInLevel, xp_needed: xpNeeded, pct,
+      unlocked_items: unlocked, upcoming_unlocks: upcoming,
+      all_unlocks: LEVEL_UNLOCKS.map(([lv, k, v, label]) => ({ level: lv, kind: k, value: v, label })),
+    });
+  },
+
+  // ---- activity buckets ----
+  "activity": async ({ user, body }) => {
+    const range = body.range_ ?? "week";
+    const days = range === "year" ? 365 : range === "month" ? 30 : 7;
+    const start = new Date(Date.now() - days * 24 * 3600 * 1000).toISOString().slice(0, 10);
+    const { data: rows } = await db.from("spirals").select("created_at").eq("user_id", user.user_id).gte("created_at", start);
+    const buckets: Record<string, number> = {};
+    for (const r of rows ?? []) {
+      const d = String(r.created_at).slice(0, 10);
+      const key = range === "year" ? d.slice(0, 7) : d;
+      buckets[key] = (buckets[key] ?? 0) + 1;
+    }
+    return json({ range, buckets: Object.entries(buckets).sort().map(([date, count]) => ({ date, count })) });
+  },
+
+  // ---- me ----
   "me": async ({ user }) => json({ user: userPublic(user) }),
 
   "preferences": async ({ user, body }) => {
@@ -353,13 +503,17 @@ Deno.serve(async (req) => {
   if (req.method === "OPTIONS") return new Response("ok", { headers: CORS });
   if (req.method !== "POST") return json({ detail: "Method not allowed" }, 405);
   try {
-    const user = await getUser(req);
-    if (!user) return json({ detail: "Not authenticated" }, 401);
     const body = await req.json();
     const action = String(body.action ?? "");
     const h = handlers[action];
     if (!h) return json({ detail: `Unknown action: ${action}` }, 400);
-    return await h({ user, body });
+    // Login actions don't require an existing session; everything else does.
+    let user = null;
+    if (!UNAUTHED.has(action)) {
+      user = await getUser(req);
+      if (!user) return json({ detail: "Not authenticated" }, 401);
+    }
+    return await h({ user, body, req });
   } catch (e) {
     console.error("[api] error:", e);
     return json({ detail: `Server error: ${e}` }, 500);
