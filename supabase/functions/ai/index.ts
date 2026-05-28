@@ -248,6 +248,152 @@ function compatFallback(reason: string) {
   };
 }
 
+// ---- Spiral prompt (loaded from app_config, base64 JSON of the exact
+//      server.py templates so quality is byte-identical) ----------------
+let SPIRAL_PROMPTS: Record<string, string> | null = null;
+async function getSpiralPrompts(): Promise<Record<string, string>> {
+  if (SPIRAL_PROMPTS) return SPIRAL_PROMPTS;
+  const { data } = await db.from("app_config").select("value").eq("key", "spiral_prompts").maybeSingle();
+  if (!data?.value) throw new Error("spiral prompts not configured");
+  const bin = atob(data.value);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  SPIRAL_PROMPTS = JSON.parse(new TextDecoder().decode(bytes));
+  return SPIRAL_PROMPTS!;
+}
+function buildSpiralPrompt(tmpl: string, situation: string, category: string): string {
+  return tmpl.split("__SITUATION__").join(situation).split("__CATEGORY__").join(category || "");
+}
+function spiralFallback(reason: string) {
+  return {
+    name: "Untitled",
+    outcomes: [
+      { title: "It lands quieter than your brain says", description: "The most likely version is the boring one: this resolves without the catastrophe your mind has been rehearsing.", probability: 60, severity: "likely", reality_check: "Most worries expire before they ever happen." },
+      { title: "It actually goes well", description: "There's a real chance this turns out fine, even good.", probability: 25, severity: "best", reality_check: "You're allowed to plan for the good version too." },
+      { title: "The feared version", description: "Even if the worst happens, you'd handle it the way you've handled everything before.", probability: 15, severity: "worst", reality_check: "Knowing the bad version early buys you nothing." },
+    ],
+    in_control: ["What you do in the next hour", "Whether you keep re-reading this"],
+    out_of_control: ["What other people decide", "The timing of someone else's reply"],
+    action_steps: ["Put the phone down for ten minutes", "Write the one sentence you actually want to say", "Come back to this tomorrow, not tonight"],
+    verdict: { verdict_text: "Your worry will keep. Sleep on it." },
+    _ai_source: `fallback: ${reason}`,
+  };
+}
+
+// ---- Streak + activity bump (port of bump_streak_and_total) ------------
+async function recordActivity(uid: string, today: string, source: string, freezeDates: string[]) {
+  const col = source === "spiral" ? "spiral_count" : source === "text_check" ? "text_check_count" : "compat_count";
+  const { data: ex } = await db.from("streak_activity").select("*").eq("user_id", uid).eq("activity_date", today).maybeSingle();
+  if (ex) {
+    const upd: any = { kind: ex.kind === "freeze" ? "active" : ex.kind };
+    upd[col] = (ex[col] ?? 0) + 1;
+    await db.from("streak_activity").update(upd).eq("user_id", uid).eq("activity_date", today);
+  } else {
+    const ins: any = { user_id: uid, activity_date: today, kind: "active", spiral_count: 0, text_check_count: 0, compat_count: 0 };
+    ins[col] = 1;
+    await db.from("streak_activity").insert(ins);
+  }
+  for (const d of freezeDates) {
+    const { data: fe } = await db.from("streak_activity").select("user_id").eq("user_id", uid).eq("activity_date", d).maybeSingle();
+    if (!fe) await db.from("streak_activity").insert({ user_id: uid, activity_date: d, kind: "freeze", spiral_count: 0, text_check_count: 0, compat_count: 0 });
+  }
+}
+async function bumpSpiralStreak(user: any) {
+  const today = new Date().toISOString().slice(0, 10);
+  const last = user.last_spiral_date;
+  const streak = user.streak_count ?? 0;
+  const diff = last ? Math.round((Date.parse(today) - Date.parse(String(last).slice(0, 10))) / 86400000) : null;
+  const month = new Date().toISOString().slice(0, 7);
+  let freezes = user.streak_freezes_month === month ? (user.streak_freezes_remaining ?? 3) : 3;
+  const pro = PRO_TIERS.has(user.plan_tier ?? "free");
+  let newStreak: number; const freezeDates: string[] = [];
+  if (diff === 0) newStreak = streak || 1;
+  else if (diff === 1) newStreak = streak + 1;
+  else if (diff !== null && diff >= 2 && diff <= 4 && pro && freezes >= diff - 1) {
+    for (let d = 1; d < diff; d++) { const dt = new Date(); dt.setDate(dt.getDate() - d); freezeDates.push(dt.toISOString().slice(0, 10)); }
+    freezes -= diff - 1; newStreak = streak + 1;
+  } else newStreak = 1;
+  const usedToday = user.spirals_used_date === today ? (user.spirals_used_today ?? 0) + 1 : 1;
+  await db.from("users").update({
+    streak_count: newStreak, last_active: new Date().toISOString(), last_spiral_date: today,
+    spirals_used_today: usedToday, spirals_used_date: today,
+    spirals_total: (user.spirals_total ?? 0) + 1,
+    xp: (user.xp ?? 0) + 10,
+    streak_freezes_remaining: freezes, streak_freezes_month: month,
+  }).eq("user_id", user.user_id);
+  await recordActivity(user.user_id, today, "spiral", freezeDates);
+}
+
+async function handleSpiral(user: any, body: any) {
+  const tone = String(body.tone ?? "balanced");
+  const situation = String(body.situation_text ?? "").trim();
+  const category = String(body.category ?? "");
+  if (!situation) return json({ detail: "Situation is empty" }, 400);
+  if ((user.plan_tier ?? "free") === "free" && (user.spirals_total ?? 0) >= 3) {
+    return json({ detail: "Free tier limit reached. Upgrade to keep going." }, 402);
+  }
+  if (tone.startsWith("drop:") && !PRO_TIERS.has(user.plan_tier ?? "free")) {
+    return json({ detail: "Themed drops are a Pro feature. Upgrade to use them." }, 403);
+  }
+  const spiralId = `sp_${crypto.randomUUID().replace(/-/g, "").slice(0, 18)}`;
+  await db.from("spirals").insert({
+    id: spiralId, user_id: user.user_id, situation_text: situation,
+    category, tone_used: tone, status: "processing", created_at: new Date().toISOString(),
+  });
+
+  let payload: any = null;
+  try {
+    const prompts = await getSpiralPrompts();
+    const baseTone = (tone in prompts) ? tone : "balanced";
+    const prompt = buildSpiralPrompt(prompts[baseTone], situation, category);
+    for (let attempt = 0; attempt < 3 && !payload; attempt++) {
+      const text = await runWithFallback(prompt, 4096, 1.15);
+      if (!text) break;
+      try {
+        const data = parseLoose(text);
+        const outs = data.outcomes;
+        if (!Array.isArray(outs) || outs.length < 1) throw new Error("missing outcomes");
+        for (const o of outs) {
+          o.probability = Math.max(0, Math.min(100, parseInt(o.probability) || 0));
+          let sv = String(o.severity ?? "likely").toLowerCase();
+          if (!["best", "likely", "worst"].includes(sv)) sv = "likely";
+          o.severity = sv; o.title = o.title ?? "Outcome"; o.description = o.description ?? ""; o.reality_check = o.reality_check ?? "";
+        }
+        const total = outs.reduce((s: number, o: any) => s + o.probability, 0) || 1;
+        for (const o of outs) o.probability = Math.round((o.probability * 100) / total);
+        const drift = 100 - outs.reduce((s: number, o: any) => s + o.probability, 0);
+        if (drift && outs.length) outs[0].probability += drift;
+        data.outcomes = outs;
+        data.in_control = data.in_control ?? []; data.out_of_control = data.out_of_control ?? []; data.action_steps = data.action_steps ?? [];
+        let v = data.verdict ?? {}; if (typeof v === "string") v = { verdict_text: v };
+        v.verdict_text = v.verdict_text ?? "Walk off stage.";
+        v.action_steps = v.action_steps ?? data.action_steps; v.in_control = v.in_control ?? data.in_control; v.out_of_control = v.out_of_control ?? data.out_of_control;
+        data.verdict = v; data._ai_source = "live";
+        payload = data;
+      } catch (e) { console.log(`[spiral] parse attempt ${attempt}: ${e}`); }
+    }
+  } catch (e) { console.log(`[spiral] generation error: ${e}`); }
+  if (!payload) payload = spiralFallback("all lanes failed");
+
+  let soundtrack: any = null;
+  const st = payload.soundtrack;
+  if (PRO_TIERS.has(user.plan_tier ?? "free") && st && typeof st === "object") {
+    const t = (st.title ?? "").trim(), l1 = (st.line_1 ?? "").trim(), l2 = (st.line_2 ?? "").trim();
+    if (t && l1 && l2) soundtrack = { title: t.slice(0, 60), line_1: l1.slice(0, 120), line_2: l2.slice(0, 120) };
+  }
+  await db.from("spirals").update({
+    outcomes: payload.outcomes, verdict: payload.verdict, status: "complete",
+    error_message: payload._ai_source === "live" ? "live" : payload._ai_source,
+    name: (payload.name ?? "Untitled").trim().slice(0, 32),
+    soundtrack,
+  }).eq("id", spiralId);
+
+  try { await bumpSpiralStreak(user); } catch (e) { console.log(`[spiral] streak bump failed: ${e}`); }
+
+  const { data: row } = await db.from("spirals").select("*").eq("id", spiralId).maybeSingle();
+  return json({ spiral: row });
+}
+
 // ---- Auth: resolve the custom session token to a user ------------------
 async function getUser(req: Request): Promise<any | null> {
   const auth = req.headers.get("authorization") ?? "";
@@ -352,13 +498,17 @@ Deno.serve(async (req) => {
   try {
     const user = await getUser(req);
     if (!user) return json({ detail: "Not authenticated" }, 401);
-    if (user.is_guest) return json({ detail: "Sign in to use this feature" }, 403);
-    if (!PRO_TIERS.has(user.plan_tier ?? "free")) {
-      return json({ detail: "This is a Pro feature. Upgrade for unlimited reads." }, 403);
-    }
     const body = await req.json();
-    if (body.kind === "text_check") return await handleTextCheck(user, body);
-    if (body.kind === "compat") return await handleCompat(user, body);
+    // Spirals are available to everyone (free tier capped at 3 inside
+    // handleSpiral). Text-check + compatibility are Pro-only.
+    if (body.kind === "spiral") return await handleSpiral(user, body);
+    if (body.kind === "text_check" || body.kind === "compat") {
+      if (user.is_guest) return json({ detail: "Sign in to use this feature" }, 403);
+      if (!PRO_TIERS.has(user.plan_tier ?? "free")) {
+        return json({ detail: "This is a Pro feature. Upgrade for unlimited reads." }, 403);
+      }
+      return body.kind === "text_check" ? await handleTextCheck(user, body) : await handleCompat(user, body);
+    }
     return json({ detail: "Unknown kind" }, 400);
   } catch (e) {
     console.error("[ai] unexpected:", e);

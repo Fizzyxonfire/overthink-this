@@ -1,0 +1,15 @@
+# Supabase project config. Pins per-function settings so CLI deploys
+# (`supabase functions deploy <name>`) keep the right options.
+#
+# Both functions authenticate with the app's OWN session token (read
+# from the sessions table), NOT a Supabase JWT — so the gateway's JWT
+# check must stay OFF or it would reject every request before our code
+# runs.
+
+project_id = "iripgxaqbhaxsfqsxxso"
+
+[functions.ai]
+verify_jwt = false
+
+[functions.api]
+verify_jwt = false
