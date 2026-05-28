@@ -1960,47 +1960,58 @@ async def run_compat(a: CompatPerson, b: CompatPerson) -> dict:
     }
     if not GEMINI_API_KEY and not HF_TOKEN:
         return fallback
-    from google.genai import types as gen_types
-    config = gen_types.GenerateContentConfig(
-        temperature=1.0, top_p=0.95, top_k=40,
-        max_output_tokens=2400, response_mime_type="application/json",
-    )
-    prompt = _build_compat_prompt(a, b)
-    # Generate-and-parse retry loop. run_with_full_fallback already
-    # exhausts every model/provider per call; we wrap it so a SUCCESSFUL
-    # generation that produced malformed JSON triggers a fresh
-    # generation rather than dropping the user to the offline placeholder.
-    last_err: Optional[Exception] = None
-    for attempt in range(1, 4):  # up to 3 generate+parse cycles
+    # EVERYTHING below is wrapped so this function can never raise — the
+    # worst case is the offline placeholder, never a 500 that shows the
+    # user a blank screen.
+    try:
+        # Gemini config is optional — if the SDK import or config build
+        # fails we set config=None and lean entirely on the HF lane.
+        config = None
         try:
-            text, _used_model = await run_with_full_fallback(
-                prompt,
-                gemini_config=config,
-                hf_max_tokens=2400,
-                hf_temperature=1.0,
-                log_tag="compat",
+            from google.genai import types as gen_types
+            config = gen_types.GenerateContentConfig(
+                temperature=1.0, top_p=0.95, top_k=40,
+                max_output_tokens=2400, response_mime_type="application/json",
             )
-            if not text:
-                raise ValueError("All AI lanes returned empty")
-            data = _parse_json_loose(text)
-            # Sanity / clamping
-            data["overall_chemistry"] = max(0, min(100, int(data.get("overall_chemistry", 50))))
-            axes = data.get("axes") or []
-            if not isinstance(axes, list) or len(axes) == 0:
-                raise ValueError("missing axes")
-            for ax in axes:
-                ax["score"] = max(0, min(100, int(ax.get("score", 50))))
-            data["axes"] = axes
-            data.setdefault("green_flags", [])
-            data.setdefault("red_flags", [])
-            data["_ai_source"] = "live"
-            return data
-        except Exception as exc:
-            last_err = exc
-            print(f"[compat] parse/validate attempt {attempt} failed: {type(exc).__name__}: {exc}")
-            continue
-    print(f"[compat] FALLBACK after retries — {type(last_err).__name__ if last_err else 'unknown'}: {last_err}")
-    return {**fallback, "_ai_source": f"fallback: {type(last_err).__name__ if last_err else 'unknown'}"}
+        except Exception as ce:
+            print(f"[compat] gemini config unavailable, HF-only: {type(ce).__name__}: {ce}")
+        prompt = _build_compat_prompt(a, b)
+        # Generate-and-parse retry loop.
+        last_err: Optional[Exception] = None
+        for attempt in range(1, 4):
+            try:
+                text, _used_model = await run_with_full_fallback(
+                    prompt,
+                    gemini_config=config,
+                    hf_max_tokens=2400,
+                    hf_temperature=1.0,
+                    log_tag="compat",
+                )
+                if not text:
+                    raise ValueError("All AI lanes returned empty")
+                data = _parse_json_loose(text)
+                data["overall_chemistry"] = max(0, min(100, int(data.get("overall_chemistry", 50))))
+                axes = data.get("axes") or []
+                if not isinstance(axes, list) or len(axes) == 0:
+                    raise ValueError("missing axes")
+                for ax in axes:
+                    ax["score"] = max(0, min(100, int(ax.get("score", 50))))
+                data["axes"] = axes
+                data.setdefault("green_flags", [])
+                data.setdefault("red_flags", [])
+                data["_ai_source"] = "live"
+                return data
+            except Exception as exc:
+                last_err = exc
+                print(f"[compat] parse/validate attempt {attempt} failed: {type(exc).__name__}: {exc}")
+                continue
+        print(f"[compat] FALLBACK after retries — {type(last_err).__name__ if last_err else 'unknown'}: {last_err}")
+        return {**fallback, "_ai_source": f"fallback: {type(last_err).__name__ if last_err else 'unknown'}"}
+    except Exception as outer:
+        import traceback
+        print(f"[compat] ❌ UNEXPECTED — {type(outer).__name__}: {outer}")
+        traceback.print_exc()
+        return {**fallback, "_ai_source": f"fallback: unexpected {type(outer).__name__}"}
 
 
 @app.post("/api/compatibility")
@@ -2326,62 +2337,67 @@ async def run_text_check(*, draft: str, context: str, relationship: str) -> dict
     if not GEMINI_API_KEY and not HF_TOKEN:
         print("[text-check] no GEMINI_API_KEY and no HF_TOKEN — using fallback")
         return _text_check_fallback("no_api_keys")
-    from google.genai import types as gen_types
-    config = gen_types.GenerateContentConfig(
-        temperature=1.05,
-        top_p=0.95,
-        top_k=40,
-        max_output_tokens=2048,
-        response_mime_type="application/json",
-    )
-    prompt = _build_text_check_prompt(draft=draft, context=context, relationship=relationship)
-    # Generate-and-parse retry loop — a malformed-but-present AI
-    # response triggers a fresh generation instead of going offline.
-    last_err: Optional[Exception] = None
-    for attempt in range(1, 4):
+    # Fully wrapped so this never raises — worst case is the placeholder.
+    try:
+        config = None
         try:
-            text, _used_model = await run_with_full_fallback(
-                prompt,
-                gemini_config=config,
-                hf_max_tokens=2048,
-                hf_temperature=1.05,
-                log_tag="text-check",
+            from google.genai import types as gen_types
+            config = gen_types.GenerateContentConfig(
+                temperature=1.05, top_p=0.95, top_k=40,
+                max_output_tokens=2048, response_mime_type="application/json",
             )
-            if not text:
-                raise ValueError("All AI lanes returned empty")
-            data = _parse_json_loose(text)
+        except Exception as ce:
+            print(f"[text-check] gemini config unavailable, HF-only: {type(ce).__name__}: {ce}")
+        prompt = _build_text_check_prompt(draft=draft, context=context, relationship=relationship)
+        last_err: Optional[Exception] = None
+        for attempt in range(1, 4):
+            try:
+                text, _used_model = await run_with_full_fallback(
+                    prompt,
+                    gemini_config=config,
+                    hf_max_tokens=2048,
+                    hf_temperature=1.05,
+                    log_tag="text-check",
+                )
+                if not text:
+                    raise ValueError("All AI lanes returned empty")
+                data = _parse_json_loose(text)
 
-            # Normalise + sanity-check the shape.
-            responses = data.get("predicted_responses") or []
-            if not isinstance(responses, list) or len(responses) != 3:
-                raise ValueError("predicted_responses must be a list of 3")
-            total = sum(int(r.get("probability", 0)) for r in responses) or 1
-            for r in responses:
-                r["probability"] = round(int(r.get("probability", 0)) * 100 / total)
-            drift = 100 - sum(r["probability"] for r in responses)
-            if drift != 0:
-                likely = next((r for r in responses if r.get("severity") == "likely"), responses[0])
-                likely["probability"] = max(0, min(100, likely["probability"] + drift))
-            data["predicted_responses"] = responses
+                responses = data.get("predicted_responses") or []
+                if not isinstance(responses, list) or len(responses) != 3:
+                    raise ValueError("predicted_responses must be a list of 3")
+                total = sum(int(r.get("probability", 0)) for r in responses) or 1
+                for r in responses:
+                    r["probability"] = round(int(r.get("probability", 0)) * 100 / total)
+                drift = 100 - sum(r["probability"] for r in responses)
+                if drift != 0:
+                    likely = next((r for r in responses if r.get("severity") == "likely"), responses[0])
+                    likely["probability"] = max(0, min(100, likely["probability"] + drift))
+                data["predicted_responses"] = responses
 
-            v = (data.get("verdict") or "WAIT").upper()
-            if v not in {"SEND", "WAIT", "REWRITE"}:
-                v = "WAIT"
-            data["verdict"] = v
-            data.setdefault("verdict_reason", "Take a beat before sending.")
-            data.setdefault("tone_read", "")
-            if v != "REWRITE":
-                data["rewrite_suggestion"] = None
-            else:
-                data["rewrite_suggestion"] = data.get("rewrite_suggestion") or None
-            data["_ai_source"] = "live"
-            return data
-        except Exception as exc:
-            last_err = exc
-            print(f"[text-check] parse/validate attempt {attempt} failed: {type(exc).__name__}: {exc}")
-            continue
-    print(f"[text-check] ❌ FALLBACK after retries — {type(last_err).__name__ if last_err else 'unknown'}: {last_err}")
-    return _text_check_fallback(f"{type(last_err).__name__ if last_err else 'unknown'}")
+                v = (data.get("verdict") or "WAIT").upper()
+                if v not in {"SEND", "WAIT", "REWRITE"}:
+                    v = "WAIT"
+                data["verdict"] = v
+                data.setdefault("verdict_reason", "Take a beat before sending.")
+                data.setdefault("tone_read", "")
+                if v != "REWRITE":
+                    data["rewrite_suggestion"] = None
+                else:
+                    data["rewrite_suggestion"] = data.get("rewrite_suggestion") or None
+                data["_ai_source"] = "live"
+                return data
+            except Exception as exc:
+                last_err = exc
+                print(f"[text-check] parse/validate attempt {attempt} failed: {type(exc).__name__}: {exc}")
+                continue
+        print(f"[text-check] ❌ FALLBACK after retries — {type(last_err).__name__ if last_err else 'unknown'}: {last_err}")
+        return _text_check_fallback(f"{type(last_err).__name__ if last_err else 'unknown'}")
+    except Exception as outer:
+        import traceback
+        print(f"[text-check] ❌ UNEXPECTED — {type(outer).__name__}: {outer}")
+        traceback.print_exc()
+        return _text_check_fallback(f"unexpected {type(outer).__name__}")
 
 
 class TextCheckRequest(BaseModel):
@@ -4708,6 +4724,49 @@ async def dev_revoke_pro(user: dict = Depends(get_current_user)):
         )
         row = await conn.fetchrow("SELECT * FROM users WHERE user_id = $1", user["user_id"])
     return {"user": user_public(dict(row))}
+
+
+@app.get("/api/diag/textcompat")
+async def diag_textcompat():
+    """Browser-accessible: actually RUN a text-check and a compatibility
+    analysis with sample input and report what came back. Tells us
+    instantly whether the AI lane works for these two surfaces or which
+    lane it fell back to. No auth (matches the other /api/diag routes)."""
+    out: Dict[str, Any] = {
+        "has_gemini_key": bool(GEMINI_API_KEY),
+        "has_hf_token": bool(HF_TOKEN),
+    }
+    # Text-check
+    try:
+        tc = await run_text_check(
+            draft="hey, are we still on for tonight or did plans change?",
+            context="", relationship="a friend",
+        )
+        out["text_check"] = {
+            "ok": True,
+            "ai_source": tc.get("_ai_source"),
+            "verdict": tc.get("verdict"),
+            "num_responses": len(tc.get("predicted_responses") or []),
+        }
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        out["text_check"] = {"ok": False, "error": f"{type(e).__name__}: {str(e)[:300]}"}
+    # Compatibility
+    try:
+        cp = await run_compat(
+            CompatPerson(name="Alex", gender="male", description="warm, a bit anxious", hobbies="climbing", status="single"),
+            CompatPerson(name="Sam", gender="female", description="blunt, funny", hobbies="painting", status="single"),
+        )
+        out["compatibility"] = {
+            "ok": True,
+            "ai_source": cp.get("_ai_source"),
+            "overall_chemistry": cp.get("overall_chemistry"),
+            "num_axes": len(cp.get("axes") or []),
+        }
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        out["compatibility"] = {"ok": False, "error": f"{type(e).__name__}: {str(e)[:300]}"}
+    return out
 
 
 @app.get("/api/diag/db")
