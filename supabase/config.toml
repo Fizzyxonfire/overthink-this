@@ -13,3 +13,8 @@ verify_jwt = false
 
 [functions.api]
 verify_jwt = false
+
+# RevenueCat calls this with its OWN shared-secret header, not a Supabase
+# JWT, so the gateway check must stay off.
+[functions.revenuecat]
+verify_jwt = false

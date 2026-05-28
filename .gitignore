@@ -54,3 +54,4 @@ desktop.ini
 *.log
 *.tmp
 .cache/
+supabase/.temp/

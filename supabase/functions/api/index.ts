@@ -116,6 +116,129 @@ async function createSession(userId: string): Promise<string> {
   return token;
 }
 
+function unlocksForLevel(level: number): string[] {
+  const out: string[] = [];
+  for (const [lv, kind, value] of LEVEL_UNLOCKS) if (level >= lv) out.push(`${kind}:${value}`);
+  return out;
+}
+async function grantXp(userId: string, amount: number): Promise<any> {
+  const { data: row } = await db.from("users").select("xp").eq("user_id", userId).single();
+  const newXp = (row?.xp ?? 0) + amount;
+  const newLevel = levelFromXp(newXp);
+  await db.from("users").update({ xp: newXp, level: newLevel, unlocked_items: unlocksForLevel(newLevel) }).eq("user_id", userId);
+  const { data: u } = await db.from("users").select("*").eq("user_id", userId).single();
+  return u;
+}
+
+function weekPeriod(): string {
+  const d = new Date();
+  const day = (d.getUTCDay() + 6) % 7; // Mon=0
+  d.setUTCDate(d.getUTCDate() - day);
+  return `W${d.toISOString().slice(0, 10)}`;
+}
+
+const DAILY_TASKS = [
+  { task_id: "first_spiral", label: "Create your first spiral today", xp: 50, target: 1 },
+  { task_id: "resolve_one", label: "Resolve one spiral", xp: 75, target: 1 },
+  { task_id: "brutal_tone", label: "Use the Brutal tone", xp: 40, target: 1 },
+  { task_id: "long_spiral", label: "Write a 100+ word spiral", xp: 60, target: 1 },
+  { task_id: "share_verdict", label: "Share a verdict", xp: 40, target: 1 },
+  { task_id: "plot_twist", label: "Log a plot-twist resolution", xp: 80, target: 1 },
+  { task_id: "one_text_check", label: "Stop one text from going out", xp: 60, target: 1 },
+  { task_id: "one_compat", label: "Run a compatibility test", xp: 60, target: 1 },
+];
+const WEEKLY_TASKS = [
+  { task_id: "seven_spirals", label: "Create 7 spirals this week", xp: 500, target: 7 },
+  { task_id: "five_resolved", label: "Resolve 5 spirals", xp: 400, target: 5 },
+  { task_id: "all_tones", label: "Use all 3 tones", xp: 300, target: 3 },
+  { task_id: "five_streak", label: "Hit a 5-day streak", xp: 350, target: 5 },
+  { task_id: "four_categories", label: "4 different categories", xp: 450, target: 4 },
+  { task_id: "share_three", label: "Share 3 verdicts", xp: 250, target: 3 },
+  { task_id: "gentle_three", label: "Use the Gentle tone 3x", xp: 180, target: 3 },
+  { task_id: "three_streak", label: "Hit a 3-day streak", xp: 200, target: 3 },
+  { task_id: "three_text_checks", label: "Run 3 text-checks", xp: 280, target: 3 },
+  { task_id: "two_compats", label: "Run 2 compatibility tests", xp: 240, target: 2 },
+  { task_id: "all_three_kinds", label: "Use all 3 tools (spiral / text / compat)", xp: 350, target: 3 },
+];
+async function ensureTaskRows(userId: string, day: string, week: string) {
+  for (const t of DAILY_TASKS) {
+    await db.from("user_tasks").upsert(
+      { user_id: userId, task_id: t.task_id, period: day, target: t.target, progress: 0, created_at: nowIso() },
+      { onConflict: "user_id,task_id,period", ignoreDuplicates: true },
+    );
+  }
+  for (const t of WEEKLY_TASKS) {
+    await db.from("user_tasks").upsert(
+      { user_id: userId, task_id: t.task_id, period: week, target: t.target, progress: 0, created_at: nowIso() },
+      { onConflict: "user_id,task_id,period", ignoreDuplicates: true },
+    );
+  }
+}
+
+const DROPS = [
+  { id: "stoic", label: "The Stoic", sub: "Marcus Aurelius energy", icon: "shield-outline", start: "2025-01-01", end: "2099-01-01" },
+];
+
+// Insights score — folds spirals + text-checks + compat resolutions into
+// one "how wrong your brain was" tally (port of server.py).
+async function insightsScore(user: any): Promise<Response> {
+  const [sp, tc, cp] = await Promise.all([
+    db.from("spirals").select("category,tone_used,resolution_status").eq("user_id", user.user_id).eq("status", "complete"),
+    db.from("text_checks").select("resolution_status").eq("user_id", user.user_id).not("resolution_status", "is", null),
+    db.from("compatibility_tests").select("resolution_status").eq("user_id", user.user_id).not("resolution_status", "is", null),
+  ]);
+  const items: any[] = [];
+  for (const r of sp.data ?? []) items.push({ category: r.category, tone: r.tone_used, rs: r.resolution_status });
+  for (const r of tc.data ?? []) items.push({ category: "text_check", tone: "balanced", rs: r.resolution_status });
+  for (const r of cp.data ?? []) items.push({ category: "compatibility", tone: "balanced", rs: r.resolution_status });
+  let right = 0, wrong = 0, plot = 0, resolvedCount = 0;
+  const breakdown: Record<string, number> = {};
+  const catRight: Record<string, number> = {}, catWrong: Record<string, number> = {};
+  for (const it of items) {
+    if (!it.rs) continue;
+    resolvedCount++; breakdown[it.rs] = (breakdown[it.rs] ?? 0) + 1;
+    const isRight = it.rs === "resolved" || it.rs === "plot_twist_good";
+    const isWrong = it.rs === "not_resolved" || it.rs === "plot_twist_bad";
+    if (it.rs === "plot_twist_good" || it.rs === "plot_twist_bad") plot++;
+    if (isRight) { right++; catRight[it.category] = (catRight[it.category] ?? 0) + 1; }
+    if (isWrong) { wrong++; catWrong[it.category] = (catWrong[it.category] ?? 0) + 1; }
+  }
+  const decisive = right + wrong;
+  const pct = decisive > 0 ? Math.round((right / decisive) * 100) : null;
+  const share = pct === null ? "Still tracking — resolve more to see your number."
+    : pct >= 70 ? `My brain was wrong ${pct}% of the time.`
+    : pct >= 50 ? `My worst case missed more than it landed (${pct}%).`
+    : `My brain was actually right ${100 - pct}% of the time. Rude.`;
+  return json({
+    total_spirals: items.length, resolved_count: resolvedCount,
+    worst_case_avoided_pct: pct, resolution_breakdown: breakdown,
+    best_tone: null, worst_category: null, best_category: null,
+    plot_twist_count: plot, share_line: share, is_pro: isPro(user.plan_tier), preview_only: false,
+  });
+}
+
+// Insights loops — cluster the archive by category (simplified port).
+async function insightsLoops(user: any): Promise<Response> {
+  const { data: rows } = await db.from("spirals").select("category,tags,resolution_status,resolved,created_at,situation_text")
+    .eq("user_id", user.user_id).eq("status", "complete");
+  const byCat: Record<string, any[]> = {};
+  for (const r of rows ?? []) (byCat[r.category] ??= []).push(r);
+  const loops = Object.entries(byCat)
+    .filter(([, arr]) => arr.length >= 2)
+    .map(([cat, arr]) => {
+      const resolvedCount = arr.filter((s) => s.resolution_status).length;
+      return {
+        headline: `Your ${cat} loop`, category: cat, count: arr.length,
+        tags: [], last_seen: arr[0]?.created_at ?? null,
+        resolution_breakdown: {}, resolved_count: resolvedCount,
+        worry_accuracy_pct: null,
+        sample_situations: arr.slice(0, 3).map((s) => (s.situation_text ?? "").slice(0, 100)),
+      };
+    })
+    .sort((a, b) => b.count - a.count);
+  return json({ loops, min_spirals_needed: 2, total_spirals: rows?.length ?? 0, is_pro: isPro(user.plan_tier), preview_only: !isPro(user.plan_tier) });
+}
+
 type Ctx = { user: any; body: any; req: Request };
 
 // Actions callable WITHOUT a session token (login).
@@ -216,6 +339,143 @@ const handlers: Record<string, (c: Ctx) => Promise<Response>> = {
     }
     return json({ range, buckets: Object.entries(buckets).sort().map(([date, count]) => ({ date, count })) });
   },
+
+  // ---- tasks / XP ----
+  "tasks.get": async ({ user }) => {
+    if (user.is_guest || (user.plan_tier ?? "free") === "free") return json({ detail: "Pro required for tasks" }, 402);
+    const day = todayDate();
+    const week = weekPeriod();
+    await ensureTaskRows(user.user_id, day, week);
+    const { data: rows } = await db.from("user_tasks").select("task_id,period,progress,target,claimed")
+      .eq("user_id", user.user_id).in("period", [day, week]);
+    const byId: Record<string, any> = {};
+    for (const r of rows ?? []) byId[`${r.task_id}|${r.period}`] = r;
+    const build = (list: any[], period: string) => list.map((t) => {
+      const row = byId[`${t.task_id}|${period}`];
+      return { ...t, period, progress: row?.progress ?? 0, claimed: row?.claimed ?? false };
+    });
+    return json({ daily: build(DAILY_TASKS, day), weekly: build(WEEKLY_TASKS, week) });
+  },
+  "tasks.claim": async ({ user, body }) => {
+    const day = todayDate(); const week = weekPeriod();
+    const { data: row } = await db.from("user_tasks").select("*").eq("user_id", user.user_id)
+      .eq("task_id", body.task_id).in("period", [day, week]).maybeSingle();
+    if (!row) return json({ detail: "Task not found" }, 404);
+    if (row.claimed) return json({ detail: "Already claimed" }, 400);
+    if (row.progress < row.target) return json({ detail: "Task not complete" }, 400);
+    const all: Record<string, any> = {}; for (const t of [...DAILY_TASKS, ...WEEKLY_TASKS]) all[t.task_id] = t;
+    const xp = all[body.task_id]?.xp ?? 0;
+    await db.from("user_tasks").update({ claimed: true, claimed_at: nowIso() }).eq("id", row.id);
+    const nu = await grantXp(user.user_id, xp);
+    return json({ claimed: true, xp_granted: xp, level: nu.level, xp: nu.xp, unlocked_items: nu.unlocked_items ?? [] });
+  },
+
+  // ---- drops ----
+  "drops.current": async ({ user }) => {
+    const today = todayDate();
+    const active = DROPS.find((d) => d.start <= today && today < d.end) ?? null;
+    const pub = (d: any) => ({ id: d.id, label: d.label, sub: d.sub, icon: d.icon, starts_at: d.start, ends_at: d.end, tone_id: `drop:${d.id}` });
+    return json({ active: active ? pub(active) : null, next: null, is_pro: isPro(user.plan_tier) });
+  },
+
+  // ---- profile stats ----
+  "profile.stats": async ({ user }) => {
+    const { data: rows } = await db.from("spirals").select("category,tone_used,resolved").eq("user_id", user.user_id);
+    const total = rows?.length ?? 0;
+    const resolved = (rows ?? []).filter((r: any) => r.resolved).length;
+    const byCat: Record<string, number> = {}, byTone: Record<string, number> = {};
+    for (const r of rows ?? []) { byCat[r.category] = (byCat[r.category] ?? 0) + 1; byTone[r.tone_used] = (byTone[r.tone_used] ?? 0) + 1; }
+    return json({ total, resolved, resolved_pct: total ? Math.round((resolved / total) * 100) : 0, by_category: byCat, by_tone: byTone });
+  },
+  "profile.full_stats": async ({ user }) => {
+    const { data: rows } = await db.from("spirals").select("category,tone_used,resolved,resolution_status,created_at").eq("user_id", user.user_id);
+    const total = rows?.length ?? 0;
+    const resolved = (rows ?? []).filter((r: any) => r.resolved).length;
+    const byCat: Record<string, number> = {}, byTone: Record<string, number> = {};
+    for (const r of rows ?? []) { byCat[r.category] = (byCat[r.category] ?? 0) + 1; byTone[r.tone_used] = (byTone[r.tone_used] ?? 0) + 1; }
+    return json({
+      total, resolved, resolved_pct: total ? Math.round((resolved / total) * 100) : 0,
+      by_category: byCat, by_tone: byTone,
+      streak_count: user.streak_count ?? 0, xp: user.xp ?? 0, level: levelFromXp(user.xp ?? 0),
+      spirals_total: user.spirals_total ?? 0,
+    });
+  },
+  "wrapped": async ({ user }) => {
+    const { data: rows } = await db.from("spirals").select("category").eq("user_id", user.user_id);
+    const byCat: Record<string, number> = {};
+    for (const r of rows ?? []) byCat[r.category] = (byCat[r.category] ?? 0) + 1;
+    const top = Object.entries(byCat).sort((a, b) => b[1] - a[1])[0];
+    return json({ total_spirals: rows?.length ?? 0, top_category: top?.[0] ?? null, streak_count: user.streak_count ?? 0 });
+  },
+
+  // ---- insights ----
+  "insights.score": async ({ user }) => insightsScore(user),
+  "insights.loops": async ({ user }) => insightsLoops(user),
+  "insights.checkin_candidate": async ({ user }) => {
+    const { data } = await db.from("spirals").select("id,name,category,created_at")
+      .eq("user_id", user.user_id).eq("resolved", false).order("created_at", { ascending: false }).limit(1);
+    const s = (data ?? [])[0];
+    return json({ spiral: s ? { id: s.id, name: s.name ?? "your spiral", category: s.category, created_at: s.created_at } : null, is_pro: isPro(user.plan_tier) });
+  },
+
+  // ---- thinkpass ----
+  "thinkpass.tiers": async ({ user }) => {
+    const level = levelFromXp(user.xp ?? 0);
+    let unlocked = user.unlocked_items ?? []; if (typeof unlocked === "string") { try { unlocked = JSON.parse(unlocked); } catch { unlocked = []; } }
+    const tiers = LEVEL_UNLOCKS.map(([lv, kind, value, label]) => ({
+      level: lv, kind, value, label,
+      claimed: unlocked.includes(`${kind}:${value}`),
+      ready: level >= lv, locked: level < lv,
+    }));
+    return json({ tiers, current_level: level });
+  },
+  "thinkpass.claim": async ({ user, body }) => {
+    const level = levelFromXp(user.xp ?? 0);
+    const tier = LEVEL_UNLOCKS.find(([lv]) => lv === body.level);
+    if (!tier) return json({ detail: "Tier not found" }, 404);
+    if (level < tier[0]) return json({ detail: "Tier not reached" }, 400);
+    let unlocked = user.unlocked_items ?? []; if (typeof unlocked === "string") { try { unlocked = JSON.parse(unlocked); } catch { unlocked = []; } }
+    const item = `${tier[1]}:${tier[2]}`;
+    if (!unlocked.includes(item)) unlocked.push(item);
+    await db.from("users").update({ unlocked_items: unlocked }).eq("user_id", user.user_id);
+    return json({ ok: true, claimed_tier: tier[0], item, unlocked_items: unlocked });
+  },
+
+  // ---- phone OTP (dev — no SMS provider wired) ----
+  "phone.send": async () => json({ ok: true, message: "OTP sending isn't configured.", dev_otp: "000000" }),
+  "phone.verify": async ({ user }) => json({ user: userPublic(user) }),
+
+  // ---- dev tools ----
+  "dev.grant_pro": async ({ user }) => {
+    await db.from("users").update({ plan_tier: "pro_monthly", has_ever_subscribed: true }).eq("user_id", user.user_id);
+    const { data: u } = await db.from("users").select("*").eq("user_id", user.user_id).single();
+    return json({ user: userPublic(u) });
+  },
+  "dev.revoke_pro": async ({ user }) => {
+    await db.from("users").update({ plan_tier: "free" }).eq("user_id", user.user_id);
+    const { data: u } = await db.from("users").select("*").eq("user_id", user.user_id).single();
+    return json({ user: userPublic(u) });
+  },
+  "dev.reset_xp": async ({ user }) => {
+    await db.from("users").update({ xp: 0, level: 1, unlocked_items: [] }).eq("user_id", user.user_id);
+    const { data: u } = await db.from("users").select("*").eq("user_id", user.user_id).single();
+    return json({ user: userPublic(u) });
+  },
+
+  // ---- payments (RevenueCat) ----
+  // Purchases happen natively in the app via the RevenueCat SDK; Pro is
+  // granted server-side by the separate "revenuecat" webhook function.
+  // packages stays here so the paywall can render plan cards.
+  "payments.packages": async () => json({
+    packages: [
+      { id: "weekly", label: "Weekly", amount: 1.99, currency: "usd", tier: "pro_weekly" },
+      { id: "monthly", label: "Monthly", amount: 4.99, currency: "usd", tier: "pro_monthly" },
+      { id: "lifetime", label: "Lifetime", amount: 49.99, currency: "usd", tier: "lifetime" },
+    ],
+  }),
+  "payments.checkout": async () => json({ detail: "Upgrades now happen through in-app purchase. Tap a plan to buy.", revenuecat: true }, 400),
+  "payments.status": async ({ user }) => json({ plan_tier: user.plan_tier ?? "free", is_pro: isPro(user.plan_tier) }),
+  "payments.portal": async () => json({ detail: "Manage your subscription in the App Store / Play Store settings.", revenuecat: true }, 400),
 
   // ---- me ----
   "me": async ({ user }) => json({ user: userPublic(user) }),
