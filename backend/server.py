@@ -1592,8 +1592,17 @@ _ARCHIVE_TABLE_STATEMENTS: List[tuple[str, str]] = [
             folder_id TEXT,
             accent_color TEXT,
             flagged BOOLEAN DEFAULT FALSE,
+            resolved BOOLEAN DEFAULT FALSE,
+            resolution_status TEXT,
+            resolution_note TEXT,
+            resolved_at TIMESTAMPTZ,
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )"""),
+    # Resolution columns for pre-existing tables (idempotent adds).
+    ("text_checks.resolved",          "ALTER TABLE text_checks ADD COLUMN IF NOT EXISTS resolved BOOLEAN DEFAULT FALSE"),
+    ("text_checks.resolution_status", "ALTER TABLE text_checks ADD COLUMN IF NOT EXISTS resolution_status TEXT"),
+    ("text_checks.resolution_note",   "ALTER TABLE text_checks ADD COLUMN IF NOT EXISTS resolution_note TEXT"),
+    ("text_checks.resolved_at",       "ALTER TABLE text_checks ADD COLUMN IF NOT EXISTS resolved_at TIMESTAMPTZ"),
     ("compatibility_tests",
         """CREATE TABLE IF NOT EXISTS compatibility_tests (
             id TEXT PRIMARY KEY,
@@ -1605,8 +1614,16 @@ _ARCHIVE_TABLE_STATEMENTS: List[tuple[str, str]] = [
             folder_id TEXT,
             accent_color TEXT,
             flagged BOOLEAN DEFAULT FALSE,
+            resolved BOOLEAN DEFAULT FALSE,
+            resolution_status TEXT,
+            resolution_note TEXT,
+            resolved_at TIMESTAMPTZ,
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )"""),
+    ("compatibility_tests.resolved",          "ALTER TABLE compatibility_tests ADD COLUMN IF NOT EXISTS resolved BOOLEAN DEFAULT FALSE"),
+    ("compatibility_tests.resolution_status", "ALTER TABLE compatibility_tests ADD COLUMN IF NOT EXISTS resolution_status TEXT"),
+    ("compatibility_tests.resolution_note",   "ALTER TABLE compatibility_tests ADD COLUMN IF NOT EXISTS resolution_note TEXT"),
+    ("compatibility_tests.resolved_at",       "ALTER TABLE compatibility_tests ADD COLUMN IF NOT EXISTS resolved_at TIMESTAMPTZ"),
     ("item_pairs",
         """CREATE TABLE IF NOT EXISTS item_pairs (
             id TEXT PRIMARY KEY,
@@ -2140,6 +2157,36 @@ async def delete_compatibility(cp_id: str, user: dict = Depends(get_current_user
     return {"ok": True}
 
 
+# Resolution model shared by text-check + compatibility resolve
+# endpoints. Same shape + status vocabulary as SpiralResolve so the
+# "how wrong your brain was" score can fold all three item kinds into
+# one tally: resolved / not_resolved / plot_twist_good / plot_twist_bad.
+class ItemResolve(BaseModel):
+    resolved: bool
+    resolution_status: Optional[str] = None
+    resolution_note: Optional[str] = None
+
+
+@app.patch("/api/compatibilities/{cp_id}/resolve")
+async def resolve_compatibility(cp_id: str, body: ItemResolve, user: dict = Depends(get_current_user)):
+    db_required()
+    await _ensure_archive_tables()
+    async with pool.acquire() as conn:
+        result = await conn.execute(
+            """UPDATE compatibility_tests SET
+                  resolved = $1, resolution_status = $2,
+                  resolution_note = $3, resolved_at = $4
+                WHERE id = $5 AND user_id = $6""",
+            body.resolved, body.resolution_status, body.resolution_note,
+            now_iso() if body.resolved or body.resolution_status else None,
+            cp_id, user["user_id"],
+        )
+        if result.endswith("0"):
+            raise HTTPException(404, "Compatibility test not found")
+        row = await conn.fetchrow("SELECT * FROM compatibility_tests WHERE id = $1", cp_id)
+    return {"compatibility": compat_public(dict(row))}
+
+
 class CompatSaveRequest(BaseModel):
     person_a: CompatPerson
     person_b: CompatPerson
@@ -2373,8 +2420,9 @@ def text_check_public(row: dict) -> dict:
     if isinstance(res, str):
         try: out["result"] = json.loads(res)
         except Exception: out["result"] = {}
-    if isinstance(out.get("created_at"), datetime):
-        out["created_at"] = out["created_at"].isoformat()
+    for k in ("created_at", "resolved_at"):
+        if isinstance(out.get(k), datetime):
+            out[k] = out[k].isoformat()
     return out
 
 
@@ -2385,8 +2433,9 @@ def compat_public(row: dict) -> dict:
         if isinstance(v, str):
             try: out[key] = json.loads(v)
             except Exception: out[key] = {} if key == "result" else {}
-    if isinstance(out.get("created_at"), datetime):
-        out["created_at"] = out["created_at"].isoformat()
+    for k in ("created_at", "resolved_at"):
+        if isinstance(out.get(k), datetime):
+            out[k] = out[k].isoformat()
     return out
 
 
@@ -2570,6 +2619,26 @@ async def delete_text_check(tc_id: str, user: dict = Depends(get_current_user)):
     if result.endswith("0"):
         raise HTTPException(404, "Text-check not found")
     return {"ok": True}
+
+
+@app.patch("/api/text-checks/{tc_id}/resolve")
+async def resolve_text_check(tc_id: str, body: ItemResolve, user: dict = Depends(get_current_user)):
+    db_required()
+    await _ensure_archive_tables()
+    async with pool.acquire() as conn:
+        result = await conn.execute(
+            """UPDATE text_checks SET
+                  resolved = $1, resolution_status = $2,
+                  resolution_note = $3, resolved_at = $4
+                WHERE id = $5 AND user_id = $6""",
+            body.resolved, body.resolution_status, body.resolution_note,
+            now_iso() if body.resolved or body.resolution_status else None,
+            tc_id, user["user_id"],
+        )
+        if result.endswith("0"):
+            raise HTTPException(404, "Text-check not found")
+        row = await conn.fetchrow("SELECT * FROM text_checks WHERE id = $1", tc_id)
+    return {"text_check": text_check_public(dict(row))}
 
 
 # Manual save — accepts a pre-computed result so the frontend can
@@ -4385,6 +4454,7 @@ async def insights_score(user: dict = Depends(get_current_user)):
             "is_pro": False,
             "preview_only": True,
         }
+    await _ensure_archive_tables()
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             """SELECT category, tone_used, resolved, resolution_status
@@ -4392,7 +4462,30 @@ async def insights_score(user: dict = Depends(get_current_user)):
                WHERE user_id = $1 AND status = 'complete'""",
             user["user_id"],
         )
+        # Fold in text-checks + compatibility tests. They share the same
+        # resolution vocabulary so a "was my brain wrong?" verdict counts
+        # the same regardless of which tool produced the worry. We give
+        # them synthetic categories so the per-category breakdown can
+        # still surface them distinctly.
+        tc_rows = await conn.fetch(
+            """SELECT resolution_status FROM text_checks
+                WHERE user_id = $1 AND resolution_status IS NOT NULL""",
+            user["user_id"],
+        )
+        cp_rows = await conn.fetch(
+            """SELECT resolution_status FROM compatibility_tests
+                WHERE user_id = $1 AND resolution_status IS NOT NULL""",
+            user["user_id"],
+        )
     spirals = [dict(r) for r in rows]
+    # Normalise text/compat into the same {category, tone_used,
+    # resolution_status} shape the loop below consumes.
+    for r in tc_rows:
+        spirals.append({"category": "text_check", "tone_used": "balanced",
+                        "resolved": True, "resolution_status": r["resolution_status"]})
+    for r in cp_rows:
+        spirals.append({"category": "compatibility", "tone_used": "balanced",
+                        "resolved": True, "resolution_status": r["resolution_status"]})
     total = len(spirals)
 
     # A spiral counts as "resolved" if it has any resolution_status
